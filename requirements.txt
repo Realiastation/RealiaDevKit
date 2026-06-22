@@ -1,0 +1,5 @@
+# RealiaDevKit v2.1-beta — Dépendances strictes pour l'orchestrateur local
+fastapi>=0.110.0
+uvicorn>=0.29.0
+httpx>=0.27.0
+websockets>=12.0

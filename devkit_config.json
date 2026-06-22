@@ -1,0 +1,12 @@
+{
+  "ports": {
+    "GUI_FRONTEND": 8092,
+    "ORCHESTRATOR_API": 8095,
+    "LLAMA_CPP_VISION": 9094,
+    "WEBSOCKET_MONITORING": 8093
+  },
+  "hosts": {
+    "local": "127.0.0.1",
+    "llm": "localhost"
+  }
+}

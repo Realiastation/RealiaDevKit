@@ -1,0 +1,67 @@
+# === Secrets & credentials ===
+.env
+.env.*
+*.env
+credentials*
+cred*
+**/credentials
+*.pem
+*.key
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# === Logs ===
+logs/
+*.log
+
+# === Runtime / State files (user-specific) ===
+contrat_travail.json
+state_memoire.json
+cache_slots/
+
+# === Backup / Station files (ne pas inclure dans le DevKit) ===
+_station_backup/
+_final_cleanup_backup/
+_old_legacy/
+youtu-agent/
+_local_station_backup/
+backoffice.html
+cyber_dashboard*
+station_navigation.js
+moltbot-*/
+luna_galaxie/
+
+# === Cache & temp ===
+*.bak.realia
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.db
+*.jsonl
+
+# === IDE ===
+.vscode/
+.idea/
