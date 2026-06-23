@@ -1,0 +1,19 @@
+name: Auto-tag on version bump
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'devkit_config.json'
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check if version changed
+        run: |
+          echo "Version check triggered"
+          echo "Ready for version bump detection"

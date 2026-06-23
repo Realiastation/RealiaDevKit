@@ -1185,7 +1185,7 @@ class SwarmRouter:
 
     async def _call_utu(self, prompt: str, model: str, is_trivial: bool = False) -> str:
         _t0 = time.time()
-        global cache_manager, swapper
+        # global cache_manager, swapper  # CI: unused globals kept for documentation
         
         # Résoudre le nom GGUF depuis le nom court
         gguf_model = cache_manager.api._resolve_model(model)

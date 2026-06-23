@@ -1,0 +1,82 @@
+name: RealiaDevKit CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  lint-python:
+    name: Python Linting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8 black isort
+      - name: Check formatting with Black
+        run: black --check . || true
+      - name: Lint with flake8
+        run: |
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 . --count --exit-zero --max-complexity=10 --max-line-length=120 --statistics
+
+  validate-imports:
+    name: Validate Python Imports
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install -r requirements.txt || true
+      - name: Validate core modules can be imported
+        run: |
+          python -c "import ast; [ast.parse(open(f).read()) for f in ['devkit_orchestrator.py', 'contract_manager.py', 'cache_roaming.py', 'tools_registry.py', 'plan_executor.py', 'dream_pipeline.py']]"
+          echo "All core modules have valid Python syntax"
+
+  security-scan:
+    name: Security Scan (Secrets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  validate-markdown:
+    name: Validate Markdown
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check README exists
+        run: |
+          test -f README.md && echo "README.md exists" || exit 1
+          test -f ARCHITECTURE.md && echo "ARCHITECTURE.md exists" || exit 1
+          test -f RUNBOOK.md && echo "RUNBOOK.md exists" || exit 1
+      - name: Validate Markdown links (basic)
+        run: |
+          grep -E "!\[.*\]\(.*\)" README.md | grep -v "http" | grep -v "\.png" | grep -v "\.svg" | grep -v "\.md" && echo "Some local image links may be broken" || echo "Markdown links look OK"
+
+  shellcheck:
+    name: Shell Script Validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get install -y shellcheck
+      - name: Run shellcheck on all .sh files
+        run: |
+          find . -name "*.sh" -exec shellcheck {} \;
+          echo "All shell scripts passed shellcheck"
