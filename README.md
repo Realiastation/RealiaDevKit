@@ -1,4 +1,4 @@
-![RealiaDevKit Logo](logo.svg)
+![RealiaDevKit Logo](logo.png)
 # RealiaDevKit
 **Agent-driven IDE & Local AI Swarm (Q3.6, Q3N, G4)**
 [![CI](https://github.com/Realiastation/RealiaDevKit/actions/workflows/ci.yml/badge.svg)](https://github.com/Realiastation/RealiaDevKit/actions)
