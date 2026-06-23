@@ -1,6 +1,8 @@
 ![RealiaDevKit Logo](logo.svg)
 # RealiaDevKit
 **Agent-driven IDE & Local AI Swarm (Q3.6, Q3N, G4)**
+[![CI](https://github.com/Realiastation/RealiaDevKit/actions/workflows/ci.yml/badge.svg)](https://github.com/Realiastation/RealiaDevKit/actions)
+[![Release](https://img.shields.io/github/v/release/Realiastation/RealiaDevKit?label=latest&sort=semver)](https://github.com/Realiastation/RealiaDevKit/releases)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://www.python.org/)
 [![Local First](https://img.shields.io/badge/Local_First-100%25-green.svg)]()
