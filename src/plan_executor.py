@@ -11,13 +11,16 @@ Toute décision métier (modèle, validation, correction) est prise par Gemma4.
 import json
 import time
 import re
+import asyncio
 import logging
 from typing import Optional, Dict, Any, List
 from pathlib import Path
 
+from plan_executor_exceptions import PlanExecutorError, PlanExecutionInProgress, CircularDependencyError, AgentCreationError, InvalidStepError, ModelSwapError, LLMTimeoutError, DuplicateStepError, EmptyPlanError
+
 from planner_template import get_planner_prompt
 from validator_template import get_validator_prompt
-from cache_roaming import CacheRoamingEngine
+from cache_roaming import CacheRoaming
 
 # DevSenior: CACHE_ENGINE est défini dans devkit_orchestrator.py, pas ici.
 # Le PlanExecutor reçoit une instance optionnelle via le constructeur.
@@ -32,19 +35,24 @@ if not logger.handlers:
 
 
 # ─── Constantes ──────────────────────────────────────────────────────────
-RAG_LONG_TERME = """## Contexte du Projet RealiaDev
-- Architecture : DevKit v2.0, FastAPI :8095, Frontend Vanilla JS :8092
-- 3 modèles LLM locaux sur :9094 (llama.cpp, swap séquentiel)
-- Qwen3.6-35B (cerveau/routeur) + Qwen3-Coder-Next (code) + Gemma4-12B (UI/vision)
-- Accessibilité C6-C7 : 48px targets, aria-live, keyboard-nav
-- Stockage projet : ./ (relatif au dossier DevKit)
-- Sandbox : écriture limitée au dossier projet
-- Backup : .bak.realia avant chaque modification
-- Cache KV : hiérarchie N1→N4, snapshot RAM via cache_roaming.py
-- VRAM max : 16 Go, RAM : 128 Go
-"""
-
+RAG_LONG_TERME_FILE = Path(__file__).parent / "rag_long_terme.txt"
+RAG_LONG_TERME = RAG_LONG_TERME_FILE.read_text(encoding="utf-8") if RAG_LONG_TERME_FILE.exists() else ""
 MAX_LOOP_ITERATIONS = 3  # Nombre max de tentatives de correction par étape
+
+
+# === CONSTANTES DE CONFIGURATION ===
+# Modèles
+PLANNER_MODEL = "gemma4-12b"          # Modèle par défaut pour le planning
+EXECUTOR_MODEL = "qwen3-coder-next"   # Modèle par défaut pour l'exécution
+FALLBACK_MODEL_1 = "qwen3.6-35b"      # Premier fallback
+FALLBACK_MODEL_2 = "gemma4-12b"       # Second fallback
+# Timeouts
+LLM_TIMEOUT_SECONDS = 60              # Timeout pour appels LLM (secondes)
+# Troncatures
+FEEDBACK_TRUNC_LENGTH = 200           # Longueur max feedback validation
+SUGGESTED_FIX_TRUNC_LENGTH = 500      # Longueur max suggested_fix
+FILE_CONTENT_LIMIT = 3000             # Taille max contenu fichier lu
+OUTPUT_TRUNC_LENGTH = 300             # Longueur max output exécution
 
 
 def normalize_plan_output(raw: str) -> str:
@@ -108,13 +116,64 @@ class PlanExecutor:
     - TERMINATE : Retour final au frontend
     """
     
-    def __init__(self, cache_engine: Optional[CacheRoamingEngine] = None):
+    def __init__(self, cache_engine: Optional[CacheRoaming] = None):
         self.cache = cache_engine  # DevSenior: instance optionnelle
         self.step_results: Dict[int, Dict[str, Any]] = {}
         self.plan: List[Dict[str, Any]] = []
         self.loop_count: int = 0
         self.max_loops: int = MAX_LOOP_ITERATIONS
+        self._execution_lock = asyncio.Lock()  # EC-28 : verrou d'exécution concurrente
     
+    def _detect_circular_dependencies(self, plan) -> None:
+        """Détecte les dépendances circulaires dans le plan (EC-03).
+        
+        Algorithme DFS avec détection de back-edge.
+        Si un cycle est détecté, lève CircularDependencyError.
+        
+        Args:
+            plan: Liste des étapes du plan
+            
+        Raises:
+            CircularDependencyError: Si une dépendance circulaire est détectée
+        """
+        # Construire le graphe des dépendances
+        graph = {}
+        for step in plan:
+            step_num = step.get("step")
+            depends_on = step.get("depends_on", [])
+            if depends_on is None:
+                depends_on = []
+            graph[step_num] = depends_on
+        
+        # DFS avec détection de cycle
+        visited = set()
+        rec_stack = set()
+        
+        def dfs(node):
+            visited.add(node)
+            rec_stack.add(node)
+            for dep in graph.get(node, []):
+                if dep not in visited:
+                    if dfs(dep):
+                        return True
+                elif dep in rec_stack:
+                    raise CircularDependencyError(node, dep)
+            rec_stack.remove(node)
+            return False
+        
+        for step_num in graph:
+            if step_num not in visited:
+                dfs(step_num)
+
+    def _detect_duplicate_steps(self, plan) -> None:
+        """Détecte les steps dupliqués dans le plan (EC-17)."""
+        seen_steps = set()
+        for step in plan:
+            step_num = step.get("step")
+            if step_num in seen_steps:
+                raise DuplicateStepError(step_num)
+            seen_steps.add(step_num)
+
     # ─── ÉTAPE 1 : PLAN ─────────────────────────────────────────────────
     async def generate_plan(self, task: str, context: dict = None, agent=None) -> List[Dict[str, Any]]:
         """Appelle Gemma4 pour générer un plan JSON.
@@ -135,7 +194,10 @@ class PlanExecutor:
         prefix_hash = hash_prefix(N1_SYSTEM, RAG_LONG_TERME)
         
         if self.cache:
-            self.cache.restore(prefix_hash, "gemma4-e4b")
+            try:
+                self.cache.restore(prefix_hash, PLANNER_MODEL)
+            except Exception as e:
+                logger.warning(f"Cache restore failed (continuing without cache): {e}")
         
         should_close = False
         if agent is None:
@@ -152,7 +214,10 @@ class PlanExecutor:
         
         # Snapshot N1+N2 après génération du plan
         if self.cache:
-            self.cache.snapshot(prefix_hash, "gemma4-e4b")
+            try:
+                self.cache.snapshot(prefix_hash, PLANNER_MODEL)
+            except Exception as e:
+                logger.warning(f"Cache snapshot failed (plan generated but not cached): {e}")
         
         # Nettoyage et parsing du JSON
         json_str = normalize_plan_output(raw_plan)
@@ -160,12 +225,12 @@ class PlanExecutor:
             plan = json.loads(json_str)
             if not isinstance(plan, list):
                 logger.warning(f"PLAN_PARSE_WARN | attendu liste, reçu {type(plan)}")
-                plan = [{"step": 1, "model": "gemma4-e4b", "action": "chat",
+                plan = [{"step": 1, "model": PLANNER_MODEL, "action": "chat",
                          "instruction": task, "success_criteria": "réponse produite", "depends_on": None}]
         except json.JSONDecodeError as e:
-            logger.error(f"PLAN_PARSE_FAIL | {e} | raw={raw_plan[:200]}")
+            logger.error(f"PLAN_PARSE_FAIL | {e} | raw={raw_plan[:FEEDBACK_TRUNC_LENGTH]}")
             # Fallback : plan minimal
-            plan = [{"step": 1, "model": "gemma4-e4b", "action": "chat",
+            plan = [{"step": 1, "model": PLANNER_MODEL, "action": "chat",
                      "instruction": task, "success_criteria": "réponse produite", "depends_on": None}]
         
         self.plan = plan
@@ -190,17 +255,28 @@ class PlanExecutor:
         from utu.agents import SimpleAgent
         
         step_num = step.get("step", 1)
-        model = step.get("model", "qwen3.6-35b")
+        model = step.get("model", FALLBACK_MODEL_1)
         action = step.get("action", "chat")
         instruction = step.get("instruction", "")
+        if not instruction:
+            raise InvalidStepError(step_num, "Instruction manquante ou vide")
         file_path = context.get("path") if context else None
+        
+        # EC-13 : si action=code, file_path est obligatoire
+        if action == "code" and not file_path:
+            raise InvalidStepError(step_num, "file_path manquant pour l'action 'code'")
         
         # Mapping modèle → config UTU
         config_map = {
-            "qwen3.6-35b": "realia_qwen36",
-            "qwen3-coder-next": "realia_coder",
-            "gemma4-12b": "realia_g4_12b",
+            FALLBACK_MODEL_1: "realia_qwen36",
+            EXECUTOR_MODEL: "realia_coder",
+            PLANNER_MODEL: "realia_g4_12b",
         }
+        if model not in config_map:
+            logger.warning(
+                f"Model '{model}' not in config_map, falling back to 'realia_dev'. "
+                f"Available models: {list(config_map.keys())}"
+            )
         config_name = config_map.get(model, "realia_dev")
         
         # Construire le prompt avec contexte des étapes précédentes
@@ -208,7 +284,15 @@ class PlanExecutor:
         if self.step_results:
             ctx_lines = []
             for s_num, s_result in self.step_results.items():
-                preview = str(s_result.get("output", ""))[:300]
+                output = str(s_result.get("output", ""))
+                # EC-30 : marker troncature visible
+                if len(output) > OUTPUT_TRUNC_LENGTH:
+                    logger.info(
+                        f"EC-30: Step {s_num} output truncated from {len(output)} to {OUTPUT_TRUNC_LENGTH} chars"
+                    )
+                    preview = output[:OUTPUT_TRUNC_LENGTH] + "\n[...TRUNCATED...]"
+                else:
+                    preview = output
                 ctx_lines.append(f"--- Résultat Étape {s_num} ---\n{preview}")
             if ctx_lines:
                 prompt_parts.append("\n\n[CONTEXTE DES ÉTAPES PRÉCÉDENTES]\n" + "\n\n".join(ctx_lines))
@@ -221,8 +305,8 @@ class PlanExecutor:
                 p = Path(file_path)
                 if p.exists():
                     content = p.read_text(encoding="utf-8")
-                    prompt_parts.append(f"\n[CONTENU ACTUEL]\n{content[:3000]}")
-                    if len(content) > 3000:
+                    prompt_parts.append(f"\n[CONTENU ACTUEL]\n{content[:FILE_CONTENT_LIMIT]}")
+                    if len(content) > FILE_CONTENT_LIMIT:
                         prompt_parts.append("\n[...]")
             except Exception:
                 pass
@@ -234,10 +318,23 @@ class PlanExecutor:
         full_prompt = "\n".join(prompt_parts)
         
         # DevSenior: swap VRAM séquentiel avant chaque inférence
-        from devkit_orchestrator import swap_model_if_needed  # lazy import
-        if not swap_model_if_needed(model):
-            import logging
+        from devkit_orchestrator import swapper  # instance globale ModelSwapper
+        if not swapper.swap(model):
             logger.warning(f"SWARM_SWAP_FALLBACK | step={step_num} | model={model}")
+            # EC-24 : essayer des fallbacks pour le code
+            if action == "code":
+                fallback_models = [FALLBACK_MODEL_1, PLANNER_MODEL]
+                swapped = False
+                for fallback in fallback_models:
+                    if fallback != model and swapper.swap(fallback):
+                        logger.warning(f"Model '{model}' unavailable, using fallback '{fallback}' for step {step_num}")
+                        model = fallback
+                        swapped = True
+                        break
+                if not swapped:
+                    raise ModelSwapError(f"Tous les fallbacks echoues pour {model}", step_num)
+            else:
+                raise ModelSwapError(model, step_num)  # EC-04 : swap échoué
         
         # Cache le préfixe N1+N2
         prefix_hash = hash_prefix(N1_SYSTEM, RAG_LONG_TERME)
@@ -246,13 +343,22 @@ class PlanExecutor:
         
         should_close = False
         if agent is None:
-            agent = SimpleAgent(config=config_name)
-            await agent.__aenter__()
+            try:
+                agent = SimpleAgent(config=config_name)
+                await agent.__aenter__()
+            except Exception as e:
+                logger.error(f"AGENT_CREATE_FAIL | step={step_num} | model={model} | config={config_name} | error={e}")
+                raise AgentCreationError(model, str(e)) from e
             should_close = True
         
         try:
-            result = await agent.run(full_prompt)
+            result = await asyncio.wait_for(
+                agent.run(full_prompt),
+                timeout=LLM_TIMEOUT_SECONDS  # EC-07 : timeout LLM
+            )
             output = str(result.final_output) if result.final_output else ""
+        except asyncio.TimeoutError:
+            raise LLMTimeoutError(model, LLM_TIMEOUT_SECONDS)
         finally:
             if should_close:
                 await agent.__aexit__(None, None, None)
@@ -264,10 +370,8 @@ class PlanExecutor:
         # Si action=code et file_path, écrire le résultat dans le fichier
         if action == "code" and file_path:
             try:
-                p = Path(file_path)
-                from devkit_orchestrator import create_backup  # DevSenior: backup avant écriture
-                create_backup(p)
-                p.write_text(output, encoding="utf-8")
+                from sandbox import sandbox_write
+                sandbox_write(Path(file_path), output)
                 logger.info(f"PLAN_EXEC_WRITE | step={step_num} | path={file_path} | size={len(output)}")
             except Exception as e:
                 logger.error(f"PLAN_EXEC_WRITE_FAIL | step={step_num} | error={e}")
@@ -311,8 +415,13 @@ class PlanExecutor:
             should_close = True
         
         try:
-            result = await agent.run(prompt)
+            result = await asyncio.wait_for(
+                agent.run(prompt),
+                timeout=LLM_TIMEOUT_SECONDS  # EC-07 : timeout LLM
+            )
             raw_validation = str(result.final_output)
+        except asyncio.TimeoutError:
+            raise LLMTimeoutError(PLANNER_MODEL, LLM_TIMEOUT_SECONDS)
         finally:
             if should_close:
                 await agent.__aexit__(None, None, None)
@@ -322,14 +431,14 @@ class PlanExecutor:
         try:
             validation = json.loads(json_str)
             if not isinstance(validation, dict):
-                validation = {"status": "pass", "feedback": raw_validation[:200]}
+                validation = {"status": "pass", "feedback": raw_validation[:FEEDBACK_TRUNC_LENGTH]}
         except json.JSONDecodeError:
             # Fallback : si on ne peut pas parser, on cherche "pass"/"fail"/"next" dans le texte
             lower = raw_validation.lower()
             if "pass" in lower or "ok" in lower or "succès" in lower or "valid" in lower:
-                validation = {"status": "pass", "feedback": raw_validation[:200]}
+                validation = {"status": "pass", "feedback": raw_validation[:FEEDBACK_TRUNC_LENGTH]}
             elif "fail" in lower or "erreur" in lower or "corrig" in lower:
-                validation = {"status": "fail", "feedback": raw_validation[:200], "suggested_fix": raw_validation[:500]}
+                validation = {"status": "fail", "feedback": raw_validation[:FEEDBACK_TRUNC_LENGTH], "suggested_fix": raw_validation[:SUGGESTED_FIX_TRUNC_LENGTH]}
             else:
                 validation = {"status": "pass", "feedback": "Validation implicite : décision non trouvée dans la réponse"}
         
@@ -346,6 +455,24 @@ class PlanExecutor:
     
     # ─── BOUCLE PRINCIPALE ──────────────────────────────────────────────
     async def execute_plan(self, task: str, context: dict = None) -> Dict[str, Any]:
+        """Boucle complète PLAN -> EXECUTE -> VALIDATE -> LOOP/TERMINATE.
+
+        Protégé par verrou d'exécution concurrente (EC-28).
+        """
+        context = context or {}
+
+        # EC-28 : verrou d'exécution concurrente
+        if not self._execution_lock.locked():
+            await self._execution_lock.acquire()
+        else:
+            raise PlanExecutionInProgress("execute_plan() déjà en cours")
+
+        try:
+            return await self._execute_plan_impl(task, context)
+        finally:
+            self._execution_lock.release()
+
+    async def _execute_plan_impl(self, task: str, context: dict = None) -> Dict[str, Any]:
         """Boucle complète PLAN → EXECUTE → VALIDATE → LOOP/TERMINATE.
         
         Args:
@@ -371,12 +498,26 @@ class PlanExecutor:
             # ════════════ PHASE 1 : PLAN ════════════
             logger.info("SWARM_PLAN_START | generation du plan par Gemma4")
             plan = await self.generate_plan(task, context, agent=g4_agent)
+            self._detect_circular_dependencies(plan)  # EC-03 : detection de cycle
+            self._detect_duplicate_steps(plan)  # EC-17 : detection doublons
+            
+            # EC-01 : plan vide → fallback minimal
+            if not plan:
+                logger.warning(f"Empty plan generated, using fallback minimal plan")
+                plan = [{
+                    "step": 1,
+                    "action": "chat",
+                    "model": PLANNER_MODEL,
+                    "instruction": f"Expliquer pourquoi la tâche '{task}' n'a pas pu être planifiée.",
+                    "success_criteria": "Réponse informative produite",
+                    "depends_on": None
+                }]
             
             # ════════════ PHASE 2-3-4 : EXECUTE + VALIDATE + LOOP ════════════
             all_passed = True
             for step in plan:
                 step_num = step.get("step", 1)
-                model = step.get("model", "qwen3.6-35b")
+                model = step.get("model", FALLBACK_MODEL_1)
                 action = step.get("action", "chat")
                 instruction = step.get("instruction", "")
                 depends_on = step.get("depends_on")
@@ -397,14 +538,31 @@ class PlanExecutor:
                 while not step_passed and attempt <= self.max_loops:
                     if attempt > 0:
                         logger.info(f"SWARM_LOOP | step={step_num} | attempt={attempt}/{self.max_loops}")
+                        self.loop_count += 1  # compter cette iteration comme une retry
                         # Ajouter le feedback de validation comme contexte de correction
                         fix_instruction = instruction
                         if validation.get("suggested_fix"):
                             fix_instruction += f"\n\n[FEEDBACK CORRECTION]\n{validation['suggested_fix']}"
                         corrected_step = {**step, "instruction": fix_instruction}
-                        current_output = await self.execute_step(corrected_step, context)
+                        try:
+                            current_output = await self.execute_step(corrected_step, context)
+                        except PlanExecutorError as e:
+                            logger.error(f"EXEC_STEP_FAIL | step={step_num} | attempt={attempt} | error={e}")
+                            validation = {"status": "fail", "feedback": str(e)[:FEEDBACK_TRUNC_LENGTH],
+                                          "suggested_fix": f"Erreur lors de l'exécution : {e}"}
+                            step_passed = False
+                            attempt += 1
+                            continue
                     else:
-                        current_output = await self.execute_step(step, context)
+                        try:
+                            current_output = await self.execute_step(step, context)
+                        except PlanExecutorError as e:
+                            logger.error(f"EXEC_STEP_FAIL | step={step_num} | attempt=0 | error={e}")
+                            validation = {"status": "fail", "feedback": str(e)[:FEEDBACK_TRUNC_LENGTH],
+                                          "suggested_fix": f"Erreur lors de l'exécution : {e}"}
+                            step_passed = False
+                            attempt += 1
+                            continue
                     
                     # VALIDATE (sauf pour action=chat triviale)
                     if action == "chat" and len(current_output) > 0:
@@ -437,7 +595,6 @@ class PlanExecutor:
                                 step_passed = True  # Next sans instruction = on passe
                     
                     attempt += 1
-                    self.loop_count += attempt - 1
                 
                 # Mise à jour du résultat final de l'étape
                 self.step_results[step_num] = {
@@ -465,7 +622,7 @@ class PlanExecutor:
                 status_icon = "✅" if result.get("passed") else "❌"
                 final_output_parts.append(
                     f"{status_icon} Étape {step_num} ({step.get('model')} - {step.get('action')}): "
-                    f"{val.get('feedback', 'exécuté')[:200]}"
+                    f"{val.get('feedback', 'exécuté')[:FEEDBACK_TRUNC_LENGTH]}"
                 )
             
             final_summary = "\n".join(final_output_parts)

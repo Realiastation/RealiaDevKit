@@ -1,0 +1,857 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PlanExecutor Contract v1.0.0 — Part 4: Error Handling & Edge Cases",
+  "description": "Gestion exhaustive des erreurs et cas limites du PlanExecutor. Chaque point de fragilité documenté avec sa stratégie de recovery.",
+  "version": "1.0.0",
+  "created": "2026-06-29",
+  "references": {
+    "part1_schema": "plan_executor_contract_part1_schema.json",
+    "part2_statemachine": "plan_executor_contract_part2_statemachine.json",
+    "part3_validation": "plan_executor_contract_part3_validation.json",
+    "source_code": "plan_executor.py"
+  },
+
+  "error_categories": {
+    "infrastructure": {
+      "id": "CAT-INFRA",
+      "description": "Erreurs liées à l'infrastructure système : VRAM, disque, fichiers, processus, réseau.",
+      "severity": "critical",
+      "recovery_strategies": ["retry_with_backoff", "graceful_degradation", "abort_with_feedback"],
+      "examples": [
+        "VRAM full (16 Go max, un seul modèle chargé à la fois)",
+        "Disk full (sandbox d'écriture limité au dossier projet)",
+        "Process crash (llama.cpp serveur planté)",
+        "Model not loaded (swapper.swap() échoue car le binaire GGUF est introuvable)",
+        "Permission denied (écriture fichier sans droits suffisants)",
+        "File not found (fichier cible inexistant pour action=code)",
+        "Network timeout (connexion au serveur LLM :9094 perdue)"
+      ]
+    },
+    "model": {
+      "id": "CAT-MODEL",
+      "description": "Erreurs liées aux modèles LLM : sortie JSON invalide, hallucination, timeout, bruit.",
+      "severity": "high",
+      "recovery_strategies": ["retry_with_feedback", "fallback_model", "parsing_fallback"],
+      "examples": [
+        "Invalid JSON output (modèle ne respecte pas le format demandé)",
+        "Hallucination (modèle invente des fichiers, des chemins ou des résultats)",
+        "Garbage output (modèle produit du texte inexploitable, bruit, répétitions)",
+        "Empty output (modèle ne répond rien, output vide ou null)",
+        "Response too long (modèle dépasse les limites de contexte, overflow)",
+        "Model swap crash (swapper.swap() tue le processus mais ne lance pas le nouveau)"
+      ]
+    },
+    "logic": {
+      "id": "CAT-LOGIC",
+      "description": "Erreurs liées à la logique métier : plan invalide, dépendances, structure.",
+      "severity": "high",
+      "recovery_strategies": ["regenerate_plan", "abort_with_feedback", "skip_step"],
+      "examples": [
+        "Invalid plan structure (plan n'est pas une liste, pas de steps)",
+        "Missing required fields (step sans action, model ou instruction)",
+        "Circular dependency (step 1 depends_on [2], step 2 depends_on [1])",
+        "Unknown action type (action n'est pas code/chat/reason)",
+        "Unknown model name (model n'est pas dans la config_map)",
+        "Plan too long (>= 6 steps, au-delà de la contrainte max 5)"
+      ]
+    },
+    "validation": {
+      "id": "CAT-VALID",
+      "description": "Erreurs détectées par le validateur (stochastique ou déterministe).",
+      "severity": "medium",
+      "recovery_strategies": ["retry_with_suggested_fix", "abort_with_feedback"],
+      "examples": [
+        "Code doesn't match instruction (output ne satisfait pas le success_criteria)",
+        "Syntax error (code Python invalide détecté par python -m py_compile)",
+        "Import error (imports non résolubles, modules manquants)",
+        "Missing success_criteria (étape sans critère objectif de validation)",
+        "Validation LLM parsing fail (validateur retourne du texte brut, pas du JSON)"
+      ]
+    },
+    "system": {
+      "id": "CAT-SYSTEM",
+      "description": "Erreurs système critiques : boucle infinie, deadlock, mémoire, arrêt brutal.",
+      "severity": "critical",
+      "recovery_strategies": ["hard_abort", "state_persistence"],
+      "examples": [
+        "Infinite loop (boucle while ne termine jamais, step_passed reste false indéfiniment)",
+        "Stack overflow (récursion excessive dans la boucle de correction)",
+        "Memory leak (cache KV non libéré, accumulation de step_results)",
+        "SIGTERM/SIGKILL (processus tué de l'extérieur pendant une écriture fichier)",
+        "Corrupted state (plan_executor dans un état incohérent après une erreur)"
+      ]
+    }
+  },
+
+  "recovery_strategies": {
+    "retry_with_backoff": {
+      "id": "retry_with_backoff",
+      "description": "Attente exponentielle entre les tentatives (1s, 2s, 4s, 8s, 16s, max 30s) avant de réessayer.",
+      "applicable_to": ["CAT-INFRA"],
+      "max_retries": 5,
+      "base_delay_ms": 1000,
+      "max_delay_ms": 30000,
+      "multiplier": 2,
+      "effect": "Libère la ressource (VRAM, disque) avant de réessayer"
+    },
+    "retry_with_feedback": {
+      "id": "retry_with_feedback",
+      "description": "Réessayer l'étape en injectant le feedback de l'échec précédent comme contexte de correction.",
+      "applicable_to": ["CAT-MODEL", "CAT-VALID"],
+      "max_retries": 3,
+      "effect": "Le modèle reçoit le suggested_fix et peut corriger son output"
+    },
+    "fallback_model": {
+      "id": "fallback_model",
+      "description": "Utiliser un modèle de secours (fallback dans competence_based routing) si le modèle préféré est indisponible.",
+      "applicable_to": ["CAT-MODEL"],
+      "fallback_chain": ["qwen3-coder-next → gemma4-12b → qwen3.6-35b"],
+      "effect": "L'étape continue avec un modèle différent"
+    },
+    "graceful_degradation": {
+      "id": "graceful_degradation",
+      "description": "Continuer l'exécution en ignorant l'étape problématique (non critique) ou en utilisant un comportement réduit.",
+      "applicable_to": ["CAT-INFRA", "CAT-LOGIC"],
+      "effect": "Le plan continue avec les étapes restantes, l'étape échouée est marquée comme non passée"
+    },
+    "abort_with_feedback": {
+      "id": "abort_with_feedback",
+      "description": "Arrêter l'exécution et retourner un message d'erreur explicatif à l'utilisateur.",
+      "applicable_to": ["CAT-INFRA", "CAT-LOGIC", "CAT-VALID"],
+      "effect": "Transition immédiate vers FAILED avec feedback explicatif"
+    },
+    "regenerate_plan": {
+      "id": "regenerate_plan",
+      "description": "Demander à Gemma4 de regénérer le plan depuis zéro, avec le feedback de l'échec précédent.",
+      "applicable_to": ["CAT-LOGIC"],
+      "max_attempts": 2,
+      "effect": "Nouveau plan corrigé basé sur le feedback de l'échec"
+    },
+    "parsing_fallback": {
+      "id": "parsing_fallback",
+      "description": "Utiliser l'heuristique de fallback pour parser du texte brut quand le JSON est invalide.",
+      "applicable_to": ["CAT-MODEL"],
+      "effect": "Recherche de mots-clés (pass/fail/next) dans le texte pour extraire une décision"
+    },
+    "hard_abort": {
+      "id": "hard_abort",
+      "description": "Arrêt d'urgence du PlanExecutor avec sauvegarde de l'état courant pour reprise ultérieure.",
+      "applicable_to": ["CAT-SYSTEM"],
+      "effect": "Sauvegarde du state (plan, step_results, loop_count) dans un fichier .state.realia, puis arrêt"
+    },
+    "skip_step": {
+      "id": "skip_step",
+      "description": "Passer une étape non critique qui ne peut pas être exécutée (dépendance manquante, modèle indisponible).",
+      "applicable_to": ["CAT-LOGIC"],
+      "effect": "Log warning, marquer l'étape comme non passée, continuer avec l'étape suivante"
+    },
+    "state_persistence": {
+      "id": "REC-STATE",
+      "description": "Persister l'état courant du PlanExecutor pour permettre une reprise après crash.",
+      "applicable_to": ["CAT-SYSTEM"],
+      "effect": "Snapshot périodique de self.plan, self.step_results, self.loop_count dans un fichier JSON"
+    }
+  },
+
+  "edge_cases": [
+    {
+      "id": "EC-01",
+      "trigger": "generate_plan() retourne [] (plan vide)",
+      "category": "CAT-LOGIC",
+      "recovery": "abort_with_feedback",
+      "description": "Gemma4 a généré un tableau JSON vide. Aucune étape à exécuter.",
+      "current_behavior": "Le plan vide passe dans la boucle for sans itération → TERMINATE directement avec succès (all_passed = True)",
+      "expected_behavior": "Transition vers FAILED avec feedback 'Aucune étape générée'",
+      "priority": "medium",
+      "fix_required": true
+    },
+    {
+      "id": "EC-02",
+      "trigger": "step.instruction est vide, null ou manquant",
+      "category": "CAT-LOGIC",
+      "recovery": "abort_with_feedback",
+      "description": "Une étape du plan n'a pas d'instruction. Le modèle ne sait pas quoi faire.",
+      "current_behavior": "instruction None → str(None) = 'None' passé comme prompt. Comportement indéfini du LLM.",
+      "expected_behavior": "Transition vers FAILED avec feedback 'Instruction manquante à l'étape X'",
+      "priority": "high",
+      "fix_required": true
+    },
+    {
+      "id": "EC-03",
+      "trigger": "Dépendance circulaire (step A → B → A)",
+      "category": "CAT-LOGIC",
+      "recovery": "abort_with_feedback",
+      "description": "Deux étapes se référencent mutuellement dans depends_on.",
+      "current_behavior": "Aucune détection. La dépendance manquante logge un warning (SWARM_DEP_MISSING) et continue. L'étape s'exécute sans le résultat attendu.",
+      "expected_behavior": "Détection de cycle avant exécution du plan → abort avec feedback",
+      "priority": "high",
+      "fix_required": true
+    },
+    {
+      "id": "EC-04",
+      "trigger": "Modèle indisponible (swap échoue)",
+      "category": "CAT-INFRA",
+      "recovery": "fallback_model",
+      "description": "swapper.swap(model) retourne False. Le modèle demandé n'est pas disponible (VRAM, binaire manquant, serveur planté).",
+      "current_behavior": "SWARM_SWAP_FALLBACK loggé, l'étape continue avec le modèle actuel (pas de swap). Comportement potentiellement dangereux.",
+      "expected_behavior": "Fallback vers modèle suivant dans competence_based routing. Si aucun modèle disponible → REC-ABORT.",
+      "priority": "high",
+      "fix_required": true
+    },
+    {
+      "id": "EC-05",
+      "trigger": "Fichier cible inexistant pour action=code",
+      "category": "CAT-INFRA",
+      "recovery": "skip_step",
+      "description": "action='code' mais file_path ne correspond à aucun fichier existant.",
+      "current_behavior": "Le fichier est créé si Path(file_path).write_text() réussit. Si le dossier parent n'existe pas → exception → PLAN_EXEC_WRITE_FAIL loggé.",
+      "expected_behavior": "Créer le fichier si le dossier parent existe. Sinon → REC-ABORT avec feedback 'Chemin inexistant'.",
+      "priority": "medium",
+      "fix_required": false
+    },
+    {
+      "id": "EC-06",
+      "trigger": "Backup échoue (create_backup en erreur)",
+      "category": "CAT-INFRA",
+      "recovery": "abort_with_feedback",
+      "description": "Impossible de créer le fichier .bak.realia avant modification. Permission refusée, disque plein, etc.",
+      "current_behavior": "Exception → error loggé, l'écriture ne se fait PAS (create_backup est appelé avant write_text dans un bloc try).",
+      "expected_behavior": "Abort avec feedback explicite. Ne JAMAIS écrire sans backup (GI-5 critique).",
+      "priority": "critical",
+      "fix_required": false
+    },
+    {
+      "id": "EC-07",
+      "trigger": "Timeout LLM (pas de réponse en 60s)",
+      "category": "CAT-INFRA",
+      "recovery": "retry_with_backoff",
+      "description": "Le modèle LLM ne répond pas dans le délai imparti. Serveur saturé, VRAM en cours de swap, processus bloqué.",
+      "current_behavior": "Pas de timeout explicite dans plan_executor.py. SimpleAgent.run() peut avoir son propre timeout (dépend du framework UTU).",
+      "expected_behavior": "Timeout configurable (60s pour inférence standard, 120s pour génération de plan). Retry with backoff si timeout.",
+      "priority": "high",
+      "fix_required": true
+    },
+    {
+      "id": "EC-08",
+      "trigger": "Max loops atteint (attempt > 3)",
+      "category": "CAT-LOGIC",
+      "recovery": "abort_with_feedback",
+      "description": "L'étape n'a pas passé la validation après 4 tentatives (1 première + 3 retries).",
+      "current_behavior": "Transition LOOP → FAILED. Logger SWARM_STEP_FAILED. all_passed = false. Les autres étapes continuent.",
+      "expected_behavior": "OK (comportement actuel correct). Documenté dans GI-2.",
+      "priority": "low",
+      "fix_required": false
+    },
+    {
+      "id": "EC-09",
+      "trigger": "Contexte d'étapes précédentes tronqué",
+      "category": "CAT-MODEL",
+      "recovery": "graceful_degradation",
+      "description": "Le résultat d'une étape précédente dépasse 300 caractères et est tronqué.",
+      "current_behavior": "preview = str(s_result.get('output', ''))[:300] — troncature silencieuse.",
+      "expected_behavior": "OK (comportement actuel correct). Logguer un warning si troncature active.",
+      "priority": "low",
+      "fix_required": false
+    },
+    {
+      "id": "EC-10",
+      "trigger": "Contenu fichier > 3000 caractères",
+      "category": "CAT-MODEL",
+      "recovery": "graceful_degradation",
+      "description": "Le fichier cible pour action=code est trop long pour être passé dans le prompt.",
+      "current_behavior": "content[:3000] + '[...]' — troncature avec indication explicite.",
+      "expected_behavior": "OK (comportement actuel correct).",
+      "priority": "low",
+      "fix_required": false
+    },
+    {
+      "id": "EC-11",
+      "trigger": "Validation LLM parsing fail (texte brut, pas JSON)",
+      "category": "CAT-MODEL",
+      "recovery": "parsing_fallback",
+      "description": "Le validateur ne retourne pas du JSON valide mais du texte brut (ex: 'Oui ça passe').",
+      "current_behavior": "Heuristique de fallback : recherche de mots-clés pass/fail/next dans le texte. Si aucun trouvé → pass implicite.",
+      "expected_behavior": "OK (comportement actuel correct, documenté dans Partie 3 parsing_fallback_rules).",
+      "priority": "medium",
+      "fix_required": false
+    },
+    {
+      "id": "EC-12",
+      "trigger": "Plan JSON parsing fail (Gemma4 ne retourne pas du JSON)",
+      "category": "CAT-MODEL",
+      "recovery": "parsing_fallback + abort_with_feedback",
+      "description": "Gemma4 ne génère pas un plan JSON valide. Réponse en texte libre, markdown, etc.",
+      "current_behavior": "Tentative d'extraction via normalize_plan_output() (```json ... ```). Si échec → fallback plan minimal 1 étape chat.",
+      "expected_behavior": "OK (comportement actuel correct, documenté dans Partie 3 parsing_fallback_rules).",
+      "priority": "medium",
+      "fix_required": false
+    },
+    {
+      "id": "EC-13",
+      "trigger": "Action 'code' sans file_path dans context",
+      "category": "CAT-LOGIC",
+      "recovery": "abort_with_feedback",
+      "description": "action='code' mais aucun path n'a été fourni dans le context. Le modèle ne sait pas quel fichier modifier.",
+      "current_behavior": "file_path = context.get('path') si context, sinon None. Si None et action=code → l'output est produit mais pas écrit dans un fichier.",
+      "expected_behavior": "Si action='code' ET file_path est None → REC-ABORT avec feedback 'Chemin fichier manquant pour action code'.",
+      "priority": "high",
+      "fix_required": true
+    },
+    {
+      "id": "EC-14",
+      "trigger": "Modèle non reconnu dans config_map",
+      "category": "CAT-LOGIC",
+      "recovery": "graceful_degradation",
+      "description": "Le plan référence un modèle qui n'a pas de clé dans config_map.",
+      "current_behavior": "config_map.get(model, 'realia_dev') → fallback vers realia_dev. L'étape s'exécute avec un modèle par défaut.",
+      "expected_behavior": "OK (comportement actuel correct). Logguer un warning et utiliser le fallback.",
+      "priority": "medium",
+      "fix_required": false
+    },
+    {
+      "id": "EC-15",
+      "trigger": "Swapper.swap() appelé avec un nom de modèle inexistant",
+      "category": "CAT-MODEL",
+      "recovery": "fallback_model",
+      "description": "Le modèle demandé pour le swap n'existe pas dans ModelSwapper. (ex: 'deepseek-r1' avant les fixes).",
+      "current_behavior": "swapper.swap(model) retourne False (modèle inconnu). Warning loggué. L'étape continue avec le modèle actuel.",
+      "expected_behavior": "Fallback vers le modèle par défaut (gemma4-12b). Si le swap échoue aussi → REC-ABORT.",
+      "priority": "medium",
+      "fix_required": true
+    },
+    {
+      "id": "EC-16",
+      "trigger": "Boucle de correction infinie (while never ends)",
+      "category": "CAT-SYSTEM",
+      "recovery": "hard_abort",
+      "description": "La condition step_passed ne devient jamais True et attempt ne dépasse jamais max_loops (cas de bug dans l'incrémentation).",
+      "current_behavior": "Protégé par attempt <= self.max_loops. Après max_loops + 1 itérations, attempt > max_loops → sortie de boucle.",
+      "expected_behavior": "OK (protégé par la condition de boucle). Ajouter un hard timeout (ex: 5 min) comme garde-fou supplémentaire.",
+      "priority": "low",
+      "fix_required": false
+    },
+    {
+      "id": "EC-17",
+      "trigger": "Multiple steps avec le même numéro",
+      "category": "CAT-LOGIC",
+      "recovery": "abort_with_feedback",
+      "description": "Gemma4 génère deux étapes avec le même step number (ex: deux étapes numéro 1).",
+      "current_behavior": "Le résultat de la deuxième étape écrase le premier dans step_results[step_num]. Perte de données silencieuse.",
+      "expected_behavior": "Détection de doublon → warning + renumérotation automatique des steps suivants.",
+      "priority": "medium",
+      "fix_required": true
+    },
+    {
+      "id": "EC-18",
+      "trigger": "Agent.__aenter__() échoue (création d'agent UTU impossible)",
+      "category": "CAT-INFRA",
+      "recovery": "abort_with_feedback",
+      "description": "SimpleAgent(config='realia_dev') ne peut pas être instancié. Fichier YAML manquant, framework UTU non disponible.",
+      "current_behavior": "Exception non catchée → crash du PlanExecutor. Aucun graceful degradation.",
+      "expected_behavior": "Try/except autour de SimpleAgent.__aenter__(). Si échec → REC-ABORT avec feedback explicatif.",
+      "priority": "critical",
+      "fix_required": true
+    },
+    {
+      "id": "EC-19",
+      "trigger": "Cache KV restore/snapshot échoue",
+      "category": "CAT-INFRA",
+      "recovery": "graceful_degradation",
+      "description": "cache.restore() ou cache.snapshot() lève une exception (fichier corrompu, permissions, disque).",
+      "current_behavior": "Protégé par 'if self.cache:' — si self.cache n'est pas None, l'appel est fait mais sans try/except. Exception → crash.",
+      "expected_behavior": "Try/except autour des appels cache. Si échec → warning et continue sans cache.",
+      "priority": "medium",
+      "fix_required": true
+    },
+    {
+      "id": "EC-20",
+      "trigger": "Result final_output > limite (output trop long pour le frontend)",
+      "category": "CAT-INFRA",
+      "recovery": "graceful_degradation",
+      "description": "Le résumé final (final_output) est trop long pour être retourné au frontend.",
+      "current_behavior": "Aucune limite explicite. final_output peut faire plusieurs ko (surtout si résumé Gemma4 avec le plan complet).",
+      "expected_behavior": "Troncature à 5000 caractères avec indication '...(tronqué)' si nécessaire.",
+      "priority": "low",
+      "fix_required": false
+    },
+    {
+      "id": "EC-21",
+      "trigger": "Validation 'next' sans next_step_instruction",
+      "category": "CAT-VALID",
+      "recovery": "graceful_degradation",
+      "description": "Le validateur retourne status='next' mais ne fournit pas de next_step_instruction.",
+      "current_behavior": "if next_instr: ... else: step_passed = True. L'étape est considérée comme passée silencieusement.",
+      "expected_behavior": "OK (comportement actuel correct). L'étape est passée, next sans instruction = 'tout va bien'.",
+      "priority": "low",
+      "fix_required": false
+    },
+    {
+      "id": "EC-22",
+      "trigger": "Validation sur étape déjà validée (re-validation après intermediate step)",
+      "category": "CAT-VALID",
+      "recovery": "graceful_degradation",
+      "description": "Après une étape intermédiaire (step+0.5), l'étape parente est re-validée avec le nouvel output.",
+      "current_behavior": "validation = await self.validate_step(step, current_output, ...). L'étape parente est re-validée normalement.",
+      "expected_behavior": "OK (comportement actuel correct). La re-validation peut retourner pass, fail ou next à nouveau.",
+      "priority": "low",
+      "fix_required": false
+    },
+    {
+      "id": "EC-23",
+      "trigger": "Plan avec plus de 5 étapes (Gemma4 ignore la consigne)",
+      "category": "CAT-LOGIC",
+      "recovery": "abort_with_feedback",
+      "description": "Gemma4 génère un plan avec 6 étapes ou plus, malgré la consigne 'Maximum 5 étapes'.",
+      "current_behavior": "Aucune validation. Le plan est exécuté tel quel. Toutes les étapes seront traitées.",
+      "expected_behavior": "Détection → warning + troncature du plan aux 5 premières étapes.",
+      "priority": "low",
+      "fix_required": false
+    },
+    {
+      "id": "EC-24",
+      "trigger": "action='code' mais swapper.swap() échoue pour qwen3-coder-next",
+      "category": "CAT-INFRA",
+      "recovery": "fallback_model",
+      "description": "Le modèle préféré pour le code (qwen3-coder-next) n'est pas disponible. L'étape code doit être exécutée par un autre modèle.",
+      "current_behavior": "SWARM_SWAP_FALLBACK loggé. L'étape continue avec le modèle actuel (qui peut être gemma4-12b, moins compétent en code).",
+      "expected_behavior": "Fallback vers gemma4-12b pour l'exécution, puis validation par qwen3-coder-next si re-disponible.",
+      "priority": "medium",
+      "fix_required": true
+    },
+    {
+      "id": "EC-25",
+      "trigger": "Fichier .bak.realia existe déjà (écrasement)",
+      "category": "CAT-INFRA",
+      "recovery": "graceful_degradation",
+      "description": "Un fichier .bak.realia existe déjà de la dernière modification. create_backup() doit le gérer.",
+      "current_behavior": "create_backup() dans devkit_orchestrator écrase le backup existant (pas de versioning).",
+      "expected_behavior": "Rotation de backup : .bak.realia.1, .bak.realia.2, etc. Ou au minimum un warning si écrasement.",
+      "priority": "low",
+      "fix_required": false
+    },
+    {
+      "id": "EC-26",
+      "trigger": "Gemma4 retourne une explication avant/après le JSON du plan",
+      "category": "CAT-MODEL",
+      "recovery": "parsing_fallback",
+      "description": "Le prompt demande 'UNIQUEMENT le JSON du plan' mais Gemma4 ajoute du texte explicatif autour.",
+      "current_behavior": "normalize_plan_output() extrait le bloc JSON ```json ... ``` ou le premier tableau [...]. Si rien trouvé → fallback.",
+      "expected_behavior": "OK (comportement actuel correct, normalize_plan_output gère ce cas).",
+      "priority": "low",
+      "fix_required": false
+    },
+    {
+      "id": "EC-27",
+      "trigger": "Validation LLM retourne des caractères non imprimables",
+      "category": "CAT-MODEL",
+      "recovery": "parsing_fallback",
+      "description": "Le modèle validateur retourne des bytes, des caractères de contrôle, ou du texte encodé bizarrement.",
+      "current_behavior": "str(result.final_output) convertit en string. Si bytes → chaîne échappée. Si caractères de contrôle → préservés dans le JSON.",
+      "expected_behavior": "Nettoyage : remplacer les caractères non imprimables (sauf \\n, \\t) par des espaces avant parsing.",
+      "priority": "low",
+      "fix_required": false
+    },
+    {
+      "id": "EC-28",
+      "trigger": "PlanExecutor.execute_plan() appelé deux fois en parallèle",
+      "category": "CAT-SYSTEM",
+      "recovery": "abort_with_feedback",
+      "description": "Deux exécutions concurrentes du PlanExecutor partagent la même instance (self.plan, self.step_results écrasés).",
+      "current_behavior": "Aucune protection. Les attributs self.plan, self.step_results, self.loop_count sont réinitialisés au début de execute_plan() mais peuvent être corrompus par une exécution concurrente.",
+      "expected_behavior": "Ajouter un verrou (asyncio.Lock) ou une vérification 'if self.plan: raise AlreadyRunningError'.",
+      "priority": "high",
+      "fix_required": true
+    },
+    {
+      "id": "EC-29",
+      "trigger": "step_results contient des clés non numériques",
+      "category": "CAT-LOGIC",
+      "recovery": "graceful_degradation",
+      "description": "step_results est un dict avec des clés string (str(step_num)). Si une étape a un step non numérique, la clé sera étrange.",
+      "current_behavior": "str(k) pour les clés. Si k n'est pas un nombre, la clé sera une chaîne non standard (ex: 'None', 'abc').",
+      "expected_behavior": "Validation avant stockage : si step n'est pas un nombre → warning et conversion forcée en float.",
+      "priority": "low",
+      "fix_required": false
+    },
+    {
+      "id": "EC-30",
+      "trigger": "Output LLM > limite de tokens (overflow contexte)",
+      "category": "CAT-MODEL",
+      "recovery": "graceful_degradation",
+      "description": "Le modèle produit un output qui dépasse sa fenêtre de contexte. L'output est tronqué par le framework UTU.",
+      "current_behavior": "Aucune gestion explicite. SimpleAgent.run() peut retourner un output tronqué silencieusement (dépend du framework).",
+      "expected_behavior": "Vérifier si l'output a été tronqué (si result.final_output a un flag truncated). Si oui → warning.",
+      "priority": "medium",
+      "fix_required": true
+    }
+  ],
+
+  "timeouts": {
+    "llm_inference": {
+      "default_ms": 60000,
+      "description": "Timeout pour un appel LLM standard (exécution d'une étape ou validation).",
+      "rationale": "Les modèles locaux sur :9094 (llama.cpp) répondent généralement en 5-30s. 60s couvre les cas de première exécution (swap VRAM + chargement).",
+      "on_timeout": "retry_with_backoff (REC-BACKOFF, max 3 retries)",
+      "on_all_timeouts": "fallback_model (REC-FALLBACK)",
+      "applicable_in_states": ["EXECUTE", "VALIDATE", "LOOP"]
+    },
+    "plan_generation": {
+      "default_ms": 120000,
+      "description": "Timeout pour la génération complète du plan (Phase PLAN).",
+      "rationale": "Gemma4 doit analyser la tâche, structurer le plan, et générer le JSON. Les plans complexes peuvent prendre plus de temps.",
+      "on_timeout": "fallback_to_minimal_plan (plan minimal 1 étape chat)",
+      "on_all_timeouts": "abort_with_feedback (REC-ABORT)",
+      "applicable_in_states": ["PLAN"]
+    },
+    "validation": {
+      "default_ms": 60000,
+      "description": "Timeout pour la validation d'une étape par le validateur.",
+      "rationale": "La validation est généralement rapide (10-20s) car le prompt est court (instruction + critère + output).",
+      "on_timeout": "consider_as_fail (la validation échoue par défaut, l'étape sera retentée)",
+      "on_all_timeouts": "abort_with_feedback (REC-ABORT)",
+      "applicable_in_states": ["VALIDATE"]
+    },
+    "cache_operation": {
+      "default_ms": 5000,
+      "description": "Timeout pour les opérations de cache KV (restore/snapshot).",
+      "rationale": "Les opérations sur fichiers sont rapides (ms). 5s couvre les cas de disque lent.",
+      "on_timeout": "continue_without_cache (warning, l'étape continue sans cache)",
+      "on_all_timeouts": "continue_without_cache (définitivement)",
+      "applicable_in_states": ["PLAN", "EXECUTE"]
+    }
+  },
+
+  "error_to_recovery_matrix": [
+    {
+      "error": "VRAM full (pas assez de mémoire pour charger le modèle)",
+      "category": "CAT-INFRA",
+      "primary_recovery": "retry_with_backoff",
+      "fallback_recovery": "graceful_degradation",
+      "code_location": "swapper.swap() dans devkit_orchestrator",
+      "log_pattern": "SWARM_SWAP_FALLBACK"
+    },
+    {
+      "error": "Disk full (plus d'espace disque pour écriture fichier ou cache)",
+      "category": "CAT-INFRA",
+      "primary_recovery": "retry_with_backoff",
+      "fallback_recovery": "abort_with_feedback",
+      "code_location": "Path.write_text() ou cache.snapshot()",
+      "log_pattern": "PLAN_EXEC_WRITE_FAIL ou exception disque plein"
+    },
+    {
+      "error": "Process crash (llama.cpp serveur mort)",
+      "category": "CAT-INFRA",
+      "primary_recovery": "retry_with_backoff",
+      "fallback_recovery": "abort_with_feedback",
+      "code_location": "SimpleAgent.run() → timeout ou connexion refusée",
+      "log_pattern": "(aucun log spécifique, timeout applicatif)"
+    },
+    {
+      "error": "Model not loaded (binaire GGUF introuvable)",
+      "category": "CAT-INFRA",
+      "primary_recovery": "fallback_model",
+      "fallback_recovery": "abort_with_feedback",
+      "code_location": "swapper.swap() dans devkit_orchestrator",
+      "log_pattern": "SWARM_SWAP_FALLBACK"
+    },
+    {
+      "error": "Permission denied (écriture fichier sans droits)",
+      "category": "CAT-INFRA",
+      "primary_recovery": "abort_with_feedback",
+      "fallback_recovery": null,
+      "code_location": "create_backup() ou Path.write_text()",
+      "log_pattern": "PLAN_EXEC_WRITE_FAIL"
+    },
+    {
+      "error": "File not found (fichier cible inexistant pour code)",
+      "category": "CAT-INFRA",
+      "primary_recovery": "graceful_degradation",
+      "fallback_recovery": "abort_with_feedback",
+      "code_location": "execute_step() → action=code sans file_path",
+      "log_pattern": "(aucun log, le fichier est créé silencieusement)"
+    },
+    {
+      "error": "Network timeout (connexion :9094 perdue)",
+      "category": "CAT-INFRA",
+      "primary_recovery": "retry_with_backoff",
+      "fallback_recovery": "abort_with_feedback",
+      "code_location": "SimpleAgent.run()",
+      "log_pattern": "(timeout applicatif, pas de log PlanExecutor)"
+    },
+    {
+      "error": "Invalid JSON output (modèle ne respecte pas le format)",
+      "category": "CAT-MODEL",
+      "primary_recovery": "parsing_fallback",
+      "fallback_recovery": "abort_with_feedback",
+      "code_location": "normalize_plan_output() ou normalize_json_output()",
+      "log_pattern": "PLAN_PARSE_FAIL ou SWARM_VALIDATE_FAIL"
+    },
+    {
+      "error": "Hallucination (modèle invente des données)",
+      "category": "CAT-MODEL",
+      "primary_recovery": "retry_with_feedback",
+      "fallback_recovery": "abort_with_feedback",
+      "code_location": "VALIDATE → LOOP",
+      "log_pattern": "SWARM_VALIDATE_FAIL"
+    },
+    {
+      "error": "Garbage output (texte inexploitable)",
+      "category": "CAT-MODEL",
+      "primary_recovery": "retry_with_feedback",
+      "fallback_recovery": "fallback_model",
+      "code_location": "execute_step()",
+      "log_pattern": "SWARM_STEP_EXECUTE (output_len normal mais contenu absurde)"
+    },
+    {
+      "error": "Empty output (modèle ne répond rien)",
+      "category": "CAT-MODEL",
+      "primary_recovery": "retry_with_feedback",
+      "fallback_recovery": "fallback_model",
+      "code_location": "execute_step() → output = ''",
+      "log_pattern": "SWARM_STEP_EXECUTE (output_len=0)"
+    },
+    {
+      "error": "Model swap crash (swapper échoue brutalement)",
+      "category": "CAT-MODEL",
+      "primary_recovery": "fallback_model",
+      "fallback_recovery": "abort_with_feedback",
+      "code_location": "swapper.swap() dans execute_step()",
+      "log_pattern": "SWARM_SWAP_FALLBACK"
+    },
+    {
+      "error": "Invalid plan structure (pas une liste)",
+      "category": "CAT-LOGIC",
+      "primary_recovery": "regenerate_plan",
+      "fallback_recovery": "abort_with_feedback",
+      "code_location": "generate_plan() → normalize_plan_output()",
+      "log_pattern": "PLAN_PARSE_WARN"
+    },
+    {
+      "error": "Missing required fields (step sans instruction)",
+      "category": "CAT-LOGIC",
+      "primary_recovery": "regenerate_plan",
+      "fallback_recovery": "abort_with_feedback",
+      "code_location": "generate_plan() → parsing du plan",
+      "log_pattern": "(pas de log spécifique, le plan est exécuté tel quel)"
+    },
+    {
+      "error": "Circular dependency (dépendances mutuelles)",
+      "category": "CAT-LOGIC",
+      "primary_recovery": "abort_with_feedback",
+      "fallback_recovery": null,
+      "code_location": "execute_plan() → vérification depends_on",
+      "log_pattern": "SWARM_DEP_MISSING"
+    },
+    {
+      "error": "Unknown action (action pas code/chat/reason)",
+      "category": "CAT-LOGIC",
+      "primary_recovery": "abort_with_feedback",
+      "fallback_recovery": null,
+      "code_location": "execute_step() → action",
+      "log_pattern": "(pas de log, action inconnue passée telle quelle au prompt)"
+    },
+    {
+      "error": "Code doesn't match instruction (validation échoue)",
+      "category": "CAT-VALID",
+      "primary_recovery": "retry_with_feedback",
+      "fallback_recovery": "abort_with_feedback",
+      "code_location": "VALIDATE → LOOP",
+      "log_pattern": "SWARM_VALIDATE_FAIL"
+    },
+    {
+      "error": "Syntax error (code Python invalide)",
+      "category": "CAT-VALID",
+      "primary_recovery": "retry_with_feedback",
+      "fallback_recovery": "abort_with_feedback",
+      "code_location": "VALIDATE → LOOP (vérification déterministe DET-CODE-4)",
+      "log_pattern": "SWARM_VALIDATE_FAIL"
+    },
+    {
+      "error": "Infinite loop (boucle ne termine jamais)",
+      "category": "CAT-SYSTEM",
+      "primary_recovery": "hard_abort",
+      "fallback_recovery": null,
+      "code_location": "execute_plan() → boucle while",
+      "log_pattern": "(pas de log, boucle infinie = pas de log non plus)"
+    },
+    {
+      "error": "Concurrent execution (execute_plan appelé deux fois)",
+      "category": "CAT-SYSTEM",
+      "primary_recovery": "abort_with_feedback",
+      "fallback_recovery": null,
+      "code_location": "execute_plan() → réinitialisation des attributs",
+      "log_pattern": "(pas de log, corruption silencieuse des données)"
+    },
+    {
+      "error": "Agent creation failed (SimpleAgent ne peut pas être instancié)",
+      "category": "CAT-INFRA",
+      "primary_recovery": "abort_with_feedback",
+      "fallback_recovery": null,
+      "code_location": "generate_plan() / execute_step() / validate_step()",
+      "log_pattern": "exception non catchée → crash"
+    },
+    {
+      "error": "Cache operation failed (restore/snapshot en erreur)",
+      "category": "CAT-INFRA",
+      "primary_recovery": "graceful_degradation",
+      "fallback_recovery": null,
+      "code_location": "cache.restore() / cache.snapshot()",
+      "log_pattern": "(pas de try/except, exception → crash)"
+    },
+    {
+      "error": "Output truncated (limite de tokens atteinte)",
+      "category": "CAT-MODEL",
+      "primary_recovery": "graceful_degradation",
+      "fallback_recovery": null,
+      "code_location": "SimpleAgent.run() → overflow contexte",
+      "log_pattern": "(pas de log, troncature silencieuse)"
+    },
+    {
+      "error": "Duplicate step numbers (même step dans le plan)",
+      "category": "CAT-LOGIC",
+      "primary_recovery": "graceful_degradation",
+      "fallback_recovery": "abort_with_feedback",
+      "code_location": "execute_plan() → stockage step_results",
+      "log_pattern": "(pas de log, écrasement silencieux du step_result)"
+    }
+  ],
+
+  "error_logging": {
+    "log_levels": {
+      "ERROR": "Erreur qui fait échouer l'étape courante mais pas nécessairement tout le plan",
+      "WARNING": "Situation anormale mais non bloquante (fallback utilisé, troncature, dépendance manquante)",
+      "INFO": "Informations normales d'exécution (début/fin de phase, résultat de validation)",
+      "DEBUG": "Détails d'exécution (prompt envoyé, output brut, timing cache)"
+    },
+    "structured_fields": {
+      "required": [
+        "error_category (CAT-*)",
+        "error_code (EC-XX)",
+        "error_message (description humaine)",
+        "step_num (étape concernée)",
+        "attempt (numéro de tentative)",
+        "model_used (modèle au moment de l'erreur)"
+      ],
+      "optional": [
+        "stack_trace (trace complète pour les exceptions)",
+        "plan_snapshot (état du plan au moment de l'erreur)",
+        "validation_raw (réponse brute du validateur)",
+        "output_preview (premiers 500 caractères de l'output fautif)"
+      ]
+    },
+    "alert_conditions": [
+      {
+        "id": "ALERT-1",
+        "condition": "3 consecutive failures on the same step",
+        "action": "Log CRITICAL + notifier l'utilisateur",
+        "severity": "critical"
+      },
+      {
+        "id": "ALERT-2",
+        "condition": "Infrastructure error (VRAM, disk, process crash)",
+        "action": "Log CRITICAL + tentatives de recovery automatique",
+        "severity": "critical"
+      },
+      {
+        "id": "ALERT-3",
+        "condition": "Max loops reached (attempt > 3)",
+        "action": "Log ERROR + transition FAILED",
+        "severity": "high"
+      },
+      {
+        "id": "ALERT-4",
+        "condition": "Swap fallback utilisé plus de 3 fois dans le même plan",
+        "action": "Log WARNING + suggestion de reconfiguration",
+        "severity": "medium"
+      },
+      {
+        "id": "ALERT-5",
+        "condition": "Parsing fallback utilisé (JSON invalide du LLM)",
+        "action": "Log WARNING avec l'output brut pour debug",
+        "severity": "medium"
+      }
+    ],
+    "log_format": "[PLAN_EXEC] %(asctime)s %(levelname)s %(message)s",
+    "log_handler": "StreamHandler (console), futur ajout possible vers fichier devkit.log"
+  },
+
+  "state_protection_mechanisms": {
+    "description": "Mécanismes de protection pour éviter les états corrompus ou les deadlocks.",
+    "mechanisms": [
+      {
+        "id": "PROT-1",
+        "name": "Hard timeout global",
+        "description": "Timeout absolu de 10 minutes pour l'ensemble de execute_plan(). Si dépassé → hard_abort.",
+        "implementation": "asyncio.wait_for(execute_plan(), timeout=600)",
+        "priority": "high"
+      },
+      {
+        "id": "PROT-2",
+        "name": "Loop guard (bornes de boucle)",
+        "description": "La boucle while a une condition de sortie explicite (attempt <= max_loops). Impossible de boucler indéfiniment.",
+        "status": "already_implemented",
+        "implementation": "while not step_passed and attempt <= self.max_loops:"
+      },
+      {
+        "id": "PROT-3",
+        "name": "Concurrent execution lock",
+        "description": "asyncio.Lock pour empêcher deux exécutions simultanées sur la même instance PlanExecutor.",
+        "implementation": "async with self._execution_lock: dans execute_plan()",
+        "priority": "high"
+      },
+      {
+        "id": "PROT-4",
+        "name": "Step result immutability",
+        "description": "Une fois qu'un step_result est validé (passed=True), il ne devrait pas pouvoir être écrasé.",
+        "implementation": "if step_num in self.step_results and self.step_results[step_num].get('passed'): skip",
+        "priority": "medium"
+      }
+    ]
+  },
+
+  "recovery_procedure_priority": {
+    "description": "Ordre de priorité des stratégies de recovery lorsqu'elles sont applicables simultanément.",
+    "ordered_list": [
+      {
+        "rank": 1,
+        "strategy": "parsing_fallback",
+        "rationale": "Toujours essayer de parser l'output avant de ré-exécuter (coût zéro)"
+      },
+      {
+        "rank": 2,
+        "strategy": "retry_with_feedback",
+        "rationale": "Réessayer avec le feedback du validateur (coût modéré : une inference)"
+      },
+      {
+        "rank": 3,
+        "strategy": "fallback_model",
+        "rationale": "Changer de modèle si le préféré échoue (coût modéré : swap VRAM ~ 2-4s)"
+      },
+      {
+        "rank": 4,
+        "strategy": "retry_with_backoff",
+        "rationale": "Attendre avant de réessayer (coût : temps, mais préserve l'infrastructure)"
+      },
+      {
+        "rank": 5,
+        "strategy": "regenerate_plan",
+        "rationale": "Regénérer le plan complet (coût élevé : une inference complète Gemma4)"
+      },
+      {
+        "rank": 6,
+        "strategy": "graceful_degradation",
+        "rationale": "Continuer sans l'étape problématique (coût : perte de fonctionnalité)"
+      },
+      {
+        "rank": 7,
+        "strategy": "abort_with_feedback",
+        "rationale": "Arrêter l'exécution (dernier recours, coût : tâche non accomplie)"
+      },
+      {
+        "rank": 8,
+        "strategy": "hard_abort",
+        "rationale": "Arrêt d'urgence avec sauvegarde d'état (cas système uniquement)"
+      }
+    ]
+  }
+}

@@ -1,0 +1,195 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PlanExecutor Contract v1.0.0 — Part 1: JSON Schemas",
+  "description": "Schémas JSON formels pour l'entrée, le plan et la sortie du PlanExecutor. Contrat immuable (sauf via Genesis Protocol).",
+
+  "definitions": {
+    "ModelName": {
+      "type": "string",
+      "enum": ["qwen3.6-35b", "qwen3-coder-next", "gemma4-12b"],
+      "description": "Nom du modèle LLM. Correspond aux clés de config_map dans plan_executor.py et aux noms dans CacheRoaming.MODEL_MAP."
+    },
+    "ActionType": {
+      "type": "string",
+      "enum": ["code", "chat", "reason"],
+      "description": "Type d'action : code = écriture/modification de fichier, chat = dialogue/validation, reason = analyse/diagnostic."
+    },
+    "ValidationStatus": {
+      "type": "string",
+      "enum": ["pass", "fail", "next"],
+      "description": "pass = étape validée, fail = échec nécessitant correction, next = étape supplémentaire requise avant validation finale."
+    },
+    "ExecutionStatus": {
+      "type": "string",
+      "enum": ["success", "partial", "failed"],
+      "description": "Statut global : success = toutes les étapes passées, partial = certaines étapes échouées, failed = échec critique."
+    }
+  },
+
+  "PlanExecutorInput": {
+    "title": "PlanExecutor Input",
+    "type": "object",
+    "description": "Entrée du PlanExecutor : la tâche utilisateur et le contexte optionnel.",
+    "properties": {
+      "task": {
+        "type": "string",
+        "description": "Description textuelle de la tâche à exécuter (ex: 'corrige le layout du fichier UI')."
+      },
+      "context": {
+        "type": "object",
+        "description": "Contexte optionnel de l'exécution. Propriétés libres (additionalProperties: true).",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Chemin du fichier cible (si l'action implique un fichier)."
+          },
+          "step_results": {
+            "type": "object",
+            "description": "Résultats d'étapes précédentes (pour reprise ou réinjection)."
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "required": ["task"]
+  },
+
+  "Plan": {
+    "title": "Plan",
+    "type": "array",
+    "description": "Liste ordonnée des étapes du plan. Générée par Gemma4 via get_planner_prompt().",
+    "items": {
+      "type": "object",
+      "properties": {
+        "step": {
+          "type": "number",
+          "description": "Numéro de l'étape. Peut être fractionnaire (ex: 2.5) pour les étapes intermédiaires générées par un statut 'next'."
+        },
+        "action": {
+          "$ref": "#/definitions/ActionType"
+        },
+        "model": {
+          "$ref": "#/definitions/ModelName",
+          "description": "Modèle assigné à cette étape par le planificateur Gemma4."
+        },
+        "instruction": {
+          "type": "string",
+          "description": "Instruction détaillée et autosuffisante pour le modèle exécuteur."
+        },
+        "success_criteria": {
+          "type": "string",
+          "description": "Critère objectif de validation (ex: 'le fichier contient une règle CSS @media'). Optionnel dans le plan mais requis pour la validation."
+        },
+        "depends_on": {
+          "type": "array",
+          "items": { "type": "number" },
+          "description": "Liste des numéros d'étapes dont dépend cette étape. null ou [] si aucune dépendance."
+        }
+      },
+      "required": ["step", "action", "model", "instruction"]
+    },
+    "minItems": 1,
+    "maxItems": 5
+  },
+
+  "StepResult": {
+    "title": "StepResult",
+    "type": "object",
+    "description": "Résultat détaillé d'une étape individuelle du plan.",
+    "properties": {
+      "output": {
+        "type": "string",
+        "description": "Sortie brute du modèle LLM pour cette étape. Peut être du code, du texte, ou un rapport."
+      },
+      "model": {
+        "$ref": "#/definitions/ModelName",
+        "description": "Modèle qui a exécuté cette étape."
+      },
+      "action": {
+        "$ref": "#/definitions/ActionType"
+      },
+      "file_path": {
+        "type": "string",
+        "description": "Chemin du fichier modifié (si action=code). Null si aucune modification de fichier."
+      },
+      "validation": {
+        "type": "object",
+        "description": "Résultat de la validation par Gemma4.",
+        "properties": {
+          "status": {
+            "$ref": "#/definitions/ValidationStatus"
+          },
+          "feedback": {
+            "type": "string",
+            "description": "Retour textuel du validateur sur la qualité de l'étape."
+          },
+          "suggested_fix": {
+            "type": "string",
+            "description": "Correction suggérée par le validateur (présent uniquement si status='fail')."
+          },
+          "next_step_instruction": {
+            "type": "string",
+            "description": "Instruction pour une étape supplémentaire (présent uniquement si status='next')."
+          }
+        },
+        "required": ["status"]
+      },
+      "passed": {
+        "type": "boolean",
+        "description": "true si l'étape a été validée avec succès, false sinon."
+      },
+      "attempts": {
+        "type": "integer",
+        "minimum": 1,
+        "description": "Nombre total de tentatives pour cette étape (1 = succès direct, >1 = corrections nécessaires)."
+      }
+    },
+    "required": ["output", "model", "action", "passed", "attempts"]
+  },
+
+  "PlanExecutionResult": {
+    "title": "PlanExecutionResult",
+    "type": "object",
+    "description": "Résultat global de l'exécution du plan, retourné au frontend ou à l'appelant.",
+    "properties": {
+      "task": {
+        "type": "string",
+        "description": "Copie de la tâche originale soumise."
+      },
+      "success": {
+        "type": "boolean",
+        "description": "true si toutes les étapes ont réussi, false sinon."
+      },
+      "final_output": {
+        "type": "string",
+        "description": "Résumé textuel final de l'exécution (généré par Gemma4 si plusieurs étapes)."
+      },
+      "plan": {
+        "$ref": "#/Plan",
+        "description": "Le plan qui a été exécuté (tel que généré par generate_plan())."
+      },
+      "step_results": {
+        "type": "object",
+        "description": "Dictionnaire des résultats par étape. Clés = string(numéro_étape), valeurs = StepResult.",
+        "additionalProperties": {
+          "$ref": "#/StepResult"
+        }
+      },
+      "loops": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "Nombre total de retries (corrections) toutes étapes confondues."
+      },
+      "time_elapsed_s": {
+        "type": "number",
+        "minimum": 0,
+        "description": "Temps total d'exécution en secondes."
+      },
+      "status": {
+        "$ref": "#/definitions/ExecutionStatus",
+        "description": "Statut global de l'exécution."
+      }
+    },
+    "required": ["task", "success", "plan", "step_results", "loops", "time_elapsed_s", "status"]
+  }
+}

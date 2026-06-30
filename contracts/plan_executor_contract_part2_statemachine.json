@@ -1,0 +1,438 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PlanExecutor Contract v1.0.0 — Part 2: State Machine",
+  "description": "Contrat de comportement : états, transitions, invariants et conditions de sortie du PlanExecutor.",
+  "version": "1.0.0",
+  "created": "2026-06-29",
+  "references": {
+    "part1_schema": "plan_executor_contract_part1_schema.json",
+    "source_code": "plan_executor.py"
+  },
+
+  "states": {
+    "INIT": {
+      "transitions": {},
+      "id": 0,
+      "description": "État initial. Aucun plan chargé, aucun résultat d'étape.",
+      "entry_actions": [
+        "Réinitialiser step_results = {}",
+        "Réinitialiser loop_count = 0",
+        "Réinitialiser plan = []"
+      ],
+      "invariants": [
+        "task est non null",
+        "plan est vide ou null",
+        "step_results est vide",
+        "loop_count == 0"
+      ]
+    },
+
+    "PLAN": {
+      "id": 1,
+      "description": "Génération du plan par Gemma4-12B. Appelle get_planner_prompt() puis SimpleAgent.run(). Tente de restaurer le cache KV N1+N2 avant, et snapshot après.",
+      "entry_actions": [
+        "Restaurer cache KV N1+N2 (gemma4-12b)",
+        "Construire prompt via get_planner_prompt(task, context)",
+        "Lancer inference Gemma4 via agent.run(prompt)",
+        "Parser la réponse JSON via normalize_plan_output()",
+        "Snapshot cache KV N1+N2 (gemma4-12b)"
+      ],
+      "invariants": [
+        "task est non null",
+        "model utilisé = gemma4-12b",
+        "cache_engine optionnellement présent"
+      ],
+      "transitions": {
+        "plan_generated": {
+          "to": "EXECUTE",
+          "event": "json.loads(plan_json) retourne une liste valide",
+          "conditions": [
+            "La réponse de Gemma4 contient un tableau JSON",
+            "Le tableau a au moins 1 élément",
+            "Chaque élément a les champs step, action, model, instruction"
+          ],
+          "actions": [
+            "Stocker le plan dans self.plan",
+            "Logger SWARM_PLAN_GENERATED avec le nombre d'étapes",
+            "Logger chaque étape avec SWARM_PLAN_STEP"
+          ],
+          "fallback": {
+            "description": "Si le parsing JSON échoue ou renvoie un type inattendu, un plan minimal de secours est généré",
+            "trigger": "json.JSONDecodeError ou plan non liste",
+            "fallback_plan": "[{step: 1, model: 'gemma4-12b', action: 'chat', instruction: task, success_criteria: 'réponse produite', depends_on: null}]"
+          }
+        },
+        "plan_failed": {
+          "to": "FAILED",
+          "event": "Erreur critique empêchant toute génération de plan",
+          "conditions": [
+            "Agent LLM inaccessible",
+            "Ou erreur système irrécupérable"
+          ],
+          "actions": [
+            "Logger l'erreur",
+            "Retourner status = failed"
+          ]
+        }
+      }
+    },
+
+    "EXECUTE": {
+      "id": 2,
+      "description": "Exécution d'une étape du plan. Effectue le swap VRAM si nécessaire, restaure le cache KV, appelle SimpleAgent.run(), puis snapshot le cache. Pour action=code, écrit le résultat dans le fichier cible.",
+      "entry_actions": [
+        "Swap VRAM vers model de l'étape (via swapper.swap())",
+        "Restaurer cache KV N1+N2 pour ce modèle",
+        "Construire le prompt : instruction + contexte des étapes précédentes (300 premiers char.) + contenu fichier si action=code",
+        "Lancer inference via agent.run(full_prompt)",
+        "Snapshot cache KV N1+N2",
+        "Si action=code et file_path : créer backup (.bak.realia) puis écrire le fichier"
+      ],
+      "invariants": [
+        "current_step est non null",
+        "current_step a les champs : step, action, model, instruction",
+        "model IN [qwen3.6-35b, qwen3-coder-next, gemma4-12b]",
+        "action IN [code, chat, reason]",
+        "Un seul modèle en VRAM à la fois"
+      ],
+      "transitions": {
+        "execution_success": {
+          "to": "VALIDATE",
+          "event": "agent.run() termine sans erreur",
+          "conditions": [
+            "un output a été produit (même vide)"
+          ],
+          "actions": [
+            "Stocker output dans self.step_results[step_num]",
+            "Logger SWARM_STEP_EXECUTE avec modèle et taille output"
+          ]
+        },
+        "execution_failed": {
+          "to": "VALIDATE",
+          "event": "agent.run() retourne une erreur ou output vide",
+          "conditions": [
+            "output est null ou vide",
+            "ou erreur LLM"
+          ],
+          "actions": [
+            "Stocker l'erreur dans step_results[step_num]",
+            "Logger l'erreur",
+            "Continuer vers VALIDATE (qui décidera de l'échec)"
+          ]
+        }
+      }
+    },
+
+    "VALIDATE": {
+      "id": 3,
+      "description": "Validation de l'étape exécutée par Gemma4-12B. Compare l'output au success_criteria. Peut aussi court-circuiter si action=chat avec output non vide (validation implicite).",
+      "entry_actions": [
+        "Si action == 'chat' ET output non vide : validation implicite (pass)",
+        "Sinon : construire prompt via get_validator_prompt()",
+        "Lancer inference Gemma4 via agent.run(prompt)",
+        "Parser la réponse JSON via normalize_json_output()",
+        "Si parsing échoue : détection heuristique (mots-clés pass/fail/next dans le texte)"
+      ],
+      "invariants": [
+        "step_output est non null (peut être vide)",
+        "validation_model = gemma4-12b",
+        "success_criteria est défini (ou critère implicite pour action=chat)"
+      ],
+      "transitions": {
+        "validation_pass": {
+          "to": "NEXT_STEP",
+          "event": "validation.status == 'pass'",
+          "conditions": [
+            "L'output satisfait le critère de succès",
+            "Ou validation implicite pour action=chat"
+          ],
+          "actions": [
+            "Marquer step_passed = true",
+            "Logger SWARM_VALIDATE_PASS"
+          ]
+        },
+        "validation_fail": {
+          "to": "LOOP",
+          "event": "validation.status == 'fail'",
+          "conditions": [
+            "L'output ne satisfait PAS le critère de succès",
+            "Le validateur a fourni un suggested_fix"
+          ],
+          "actions": [
+            "Marquer step_passed = false",
+            "Logger SWARM_VALIDATE_FAIL",
+            "Conserver le suggested_fix pour la correction"
+          ]
+        },
+        "validation_next": {
+          "to": "EXECUTE_NEXT_STEP",
+          "event": "validation.status == 'next'",
+          "conditions": [
+            "L'output est partiellement satisfaisant",
+            "Une instruction complémentaire (next_step_instruction) est fournie"
+          ],
+          "actions": [
+            "Logger SWARM_VALIDATE_NEXT",
+            "Créer une étape intermédiaire avec step = step_num + 0.5",
+            "Ne PAS incrémenter attempt (l'étape intermédiaire ne compte pas comme retry)"
+          ],
+          "note": "Si next_step_instruction est vide, l'étape est considérée passée (traitement silencieux)"
+        }
+      }
+    },
+
+    "LOOP": {
+      "id": 4,
+      "description": "Tentative de correction après échec de validation. Injecte le suggested_fix dans l'instruction et re-exécute l'étape.",
+      "entry_actions": [
+        "Incrémenter loop_count (compteur global de retries)",
+        "Logger SWARM_LOOP avec attempt/max_loops",
+        "Injecter suggested_fix dans l'instruction de l'étape",
+        "Exécuter la version corrigée de l'étape"
+      ],
+      "invariants": [
+        "attempt <= max_loops (max_loops = 3)",
+        "suggested_fix est non null (peut être vide)",
+        "fix_instruction = instruction + suggested_fix"
+      ],
+      "transitions": {
+        "retry_success": {
+          "to": "VALIDATE",
+          "event": "L'étape corrigée s'exécute",
+          "conditions": [
+            "attempt <= max_loops"
+          ],
+          "actions": [
+            "Exécuter execute_step() avec l'instruction corrigée",
+            "Re-valider via VALIDATE",
+            "Incrémenter attempt"
+          ],
+          "note": "La boucle while not step_passed and attempt <= max_loops permet jusqu'à max_loops + 1 tentatives (première + jusqu'à 3 retries)"
+        },
+        "max_retries_reached": {
+          "to": "FAILED",
+          "event": "attempt > max_loops après la dernière tentative",
+          "conditions": [
+            "step_passed == false",
+            "attempt > max_loops"
+          ],
+          "actions": [
+            "Logger SWARM_STEP_FAILED avec le nombre de tentatives",
+            "Marquer all_passed = false"
+          ]
+        }
+      }
+    },
+
+    "EXECUTE_NEXT_STEP": {
+      "id": 5,
+      "description": "Exécution d'une étape intermédiaire (step_num + 0.5) demandée par le validateur (status='next'). Ne compte pas comme une retry.",
+      "entry_actions": [
+        "Créer une étape avec step = step_num + 0.5",
+        "Exécuter execute_step() avec cette étape"
+      ],
+      "invariants": [
+        "next_step_instruction est non null",
+        "step_num est incrémenté de 0.5",
+        "attempt n'est PAS incrémenté"
+      ],
+      "transitions": {
+        "execution_done": {
+          "to": "VALIDATE",
+          "event": "execute_step() termine",
+          "conditions": [
+            "L'étape intermédiaire a produit un output"
+          ],
+          "actions": [
+            "Re-valider l'étape originale (pas l'intermédiaire)",
+            "Le résultat de re-validation détermine step_passed"
+          ]
+        }
+      }
+    },
+
+    "NEXT_STEP": {
+      "id": 6,
+      "description": "Passage à l'étape suivante du plan après validation réussie.",
+      "entry_actions": [
+        "Incrémenter l'index de l'étape courante",
+        "Vérifier les dépendances de la prochaine étape (depends_on)"
+      ],
+      "invariants": [
+        "current_step_index < len(plan)",
+        "step_passed == true pour l'étape courante"
+      ],
+      "transitions": {
+        "has_next_step": {
+          "to": "EXECUTE",
+          "event": "Il reste des étapes dans le plan",
+          "conditions": [
+            "current_step_index + 1 < len(plan)"
+          ],
+          "actions": [
+            "Logger le passage à l'étape suivante",
+            "Vérifier les dépendances (depends_on) — si manquantes, logger SWARM_DEP_MISSING mais continuer"
+          ]
+        },
+        "no_next_step": {
+          "to": "TERMINATE",
+          "event": "Toutes les étapes du plan ont été traitées",
+          "conditions": [
+            "current_step_index + 1 >= len(plan)"
+          ],
+          "actions": [
+            "Préparer le rapport final"
+          ]
+        }
+      }
+    },
+
+    "TERMINATE": {
+      "transitions": {},
+      "id": 7,
+      "description": "Exécution terminée avec succès. Construit le résumé final (via Gemma4 si plusieurs étapes) et retourne le résultat structuré.",
+      "entry_actions": [
+        "Construire le résumé textuel des étapes",
+        "Si all_passed ET plan a plus d'une étape : demander un résumé Gemma4",
+        "Calculer le temps d'exécution",
+        "Retourner le dictionnaire de résultat"
+      ],
+      "invariants": [
+        "all_passed == true",
+        "plan a été entièrement exécuté",
+        "status = 'success' (dans le contrat) ou 'completed' (dans le code actuel)"
+      ]
+    },
+
+    "FAILED": {
+      "transitions": {},
+      "id": 8,
+      "description": "Exécution terminée avec échec partiel ou total. Certaines étapes peuvent avoir réussi, d'autres non.",
+      "entry_actions": [
+        "Marquer toutes les étapes non exécutées comme non passées",
+        "Calculer le temps d'exécution",
+        "Retourner le dictionnaire de résultat avec all_passed = false"
+      ],
+      "invariants": [
+        "all_passed == false",
+        "status = 'partial' (certaines étapes réussies) ou 'failed' (échec critique)",
+        "loop_count peut être > 0"
+      ]
+    }
+  },
+
+  "global_invariants": [
+    {
+      "id": "GI-1",
+      "name": "Un seul modèle en VRAM",
+      "description": "Le swap VRAM est séquentiel : un seul modèle LLM est chargé dans les 16 Go de VRAM à la fois. Le swapper (ModelSwapper dans devkit_orchestrator) tue le processus précédent avant d'en lancer un nouveau.",
+      "enforced_by": "swapper.swap(model) dans execute_step()",
+      "critical": true
+    },
+    {
+      "id": "GI-2",
+      "name": "Max 3 retries par étape (Genesis rule_3)",
+      "description": "Une étape ne peut être retentée que 3 fois maximum (MAX_LOOP_ITERATIONS = 3). La boucle while autorise 4 exécutions au total (1 première + jusqu'à 3 corrections).",
+      "enforced_by": "while not step_passed and attempt <= self.max_loops",
+      "value": 3,
+      "critical": true
+    },
+    {
+      "id": "GI-3",
+      "name": "Contexte des étapes précédentes limité à 300 caractères",
+      "description": "Le contexte injecté de chaque étape précédente est tronqué à 300 caractères pour limiter la taille du prompt.",
+      "enforced_by": "preview = str(s_result.get('output', ''))[:300] dans execute_step()",
+      "value": 300,
+      "critical": false
+    },
+    {
+      "id": "GI-4",
+      "name": "Contenu fichier limité à 3000 caractères",
+      "description": "Le contenu actuel du fichier lors d'une action=code est tronqué à 3000 caractères.",
+      "enforced_by": "content[:3000] dans execute_step()",
+      "value": 3000,
+      "critical": false
+    },
+    {
+      "id": "GI-5",
+      "name": "Backup avant écriture fichier",
+      "description": "Avant toute écriture de fichier (action=code), une copie de sauvegarde .bak.realia est créée via create_backup().",
+      "enforced_by": "create_backup(p) avant p.write_text() dans execute_step()",
+      "critical": true
+    },
+    {
+      "id": "GI-6",
+      "name": "Cache KV N1+N2 partagé entre étapes",
+      "description": "Le préfixe N1 (système) + N2 (RAG long-terme) du prompt est hashé et utilisé comme clé de cache KV. Restauré avant chaque inférence, snapshot après.",
+      "enforced_by": "hash_prefix(N1_SYSTEM, RAG_LONG_TERME) + cache.restore() / cache.snapshot()",
+      "critical": false
+    },
+    {
+      "id": "GI-7",
+      "name": "Plan limité à 5 étapes",
+      "description": "Le planificateur Gemma4 ne doit pas générer plus de 5 étapes. Cette contrainte est documentée dans le prompt système (planner_template.py).",
+      "enforced_by": "get_planner_prompt() (prompt engineering, pas de validation code)",
+      "value": 5,
+      "critical": false
+    },
+    {
+      "id": "GI-8",
+      "name": "Dépendances non bloquantes",
+      "description": "Si une dépendance (depends_on) est manquante, un avertissement est loggé (SWARM_DEP_MISSING) mais l'exécution continue. Les dépendances ne sont pas bloquantes.",
+      "enforced_by": "logger.warning() dans execute_plan(), pas de raise/return",
+      "critical": false
+    }
+  ],
+
+  "exit_conditions": {
+    "success": {
+      "trigger": "Toutes les étapes du plan ont été exécutées et validées avec succès",
+      "conditions": [
+        "all_passed == true",
+        "Tous les step_results[x].passed == true",
+        "len(step_results) == len(plan)"
+      ],
+      "output": {
+        "success": true,
+        "status": "success",
+        "final_output": "Résumé textuel (généré par Gemma4 si >1 étape, sinon brut)",
+        "loops": "Nombre total de retries",
+        "time_elapsed_s": "Temps d'exécution"
+      }
+    },
+    "partial": {
+      "trigger": "Certaines étapes ont échoué après épuisement des retries, d'autres ont réussi",
+      "conditions": [
+        "all_passed == false",
+        "Au moins un step_result[x].passed == true",
+        "Au moins un step_result[x].passed == false"
+      ],
+      "output": {
+        "success": false,
+        "status": "partial",
+        "final_output": "Résumé textuel des réussites et échecs",
+        "loops": "Nombre total de retries",
+        "time_elapsed_s": "Temps d'exécution"
+      }
+    },
+    "failed": {
+      "trigger": "Toutes les étapes ont échoué ou une erreur critique empêche l'exécution",
+      "conditions": [
+        "all_passed == false",
+        "Tous les step_results[x].passed == false",
+        "Ou plan est vide (erreur de génération critique)"
+      ],
+      "output": {
+        "success": false,
+        "status": "failed",
+        "final_output": "Message d'erreur",
+        "loops": 0,
+        "time_elapsed_s": "Temps d'exécution"
+      }
+    }
+  },
+
+  "mermaid_diagram": "stateDiagram-v2\n    [*] --> INIT\n    INIT --> PLAN: task reçue\n    PLAN --> EXECUTE: plan_generated\n    PLAN --> FAILED: plan_failed (critique)\n    EXECUTE --> VALIDATE: execution terminée\n    VALIDATE --> NEXT_STEP: validation_pass\n    VALIDATE --> LOOP: validation_fail\n    VALIDATE --> EXECUTE_NEXT_STEP: validation_next\n    LOOP --> VALIDATE: retry_success (attempt++)\n    LOOP --> FAILED: max_retries_reached\n    EXECUTE_NEXT_STEP --> VALIDATE: execution_done\n    NEXT_STEP --> EXECUTE: has_next_step\n    NEXT_STEP --> TERMINATE: no_next_step\n    TERMINATE --> [*]: success\n    FAILED --> [*]: partial/failed",
+
+  "ascii_diagram": "┌─────────────────────────────────────────────────────────────────┐\n│                   PLAN EXECUTOR STATE MACHINE                    │\n├─────────────────────────────────────────────────────────────────┤\n│                                                                  │\n│   [*] ───► INIT ───► PLAN ───► EXECUTE ───► VALIDATE            │\n│                     │                          │  │  │           │\n│                     │ (fallback)               │  │  │           │\n│                     ▼                          │  │  │           │\n│                  FAILED ◄──────────────────────┘  │  │           │\n│                     ▲                             │  │           │\n│                     │ (max retries)               │  │           │\n│                     │        LOOP ◄───────────────┘  │           │\n│                     │          │                      │           │\n│                     │          └──► VALIDATE (retry)  │           │\n│                     │                                 │           │\n│                     │          EXECUTE_NEXT_STEP ◄────┘           │\n│                     │                    │                         │\n│                     │                    └──► VALIDATE             │\n│                     │                                              │\n│                     │   NEXT_STEP ◄──────────────── (pass)        │\n│                     │     │                                        │\n│                     │     ├──► EXECUTE (next step)                 │\n│                     │     └──► TERMINATE ───► [*]                  │\n│                     │                                              │\n│                     └────────────────► [*] (partial/failed)        │\n└─────────────────────────────────────────────────────────────────┘"
+}

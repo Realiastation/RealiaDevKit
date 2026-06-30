@@ -1,0 +1,640 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PlanExecutor Contract v1.0.0 — Part 3: Validation Rules",
+  "description": "Règles de validation pour les transitions de la state machine PlanExecutor. Validation distribuée avec competence-based routing.",
+  "version": "1.0.0",
+  "created": "2026-06-29",
+  "references": {
+    "part1_schema": "plan_executor_contract_part1_schema.json",
+    "part2_statemachine": "plan_executor_contract_part2_statemachine.json",
+    "validator_template": "validator_template.py",
+    "source_code": "plan_executor.py"
+  },
+
+  "validator_selection": {
+    "strategy": "competence_based",
+    "description": "Le validateur est sélectionné dynamiquement selon les compétences du modèle, le type d'étape, le domaine de l'instruction et la disponibilité VRAM. Aucun modèle n'est hardcodé comme unique validateur.",
+    "routing_rules": [
+      {
+        "condition": "action == 'code'",
+        "preferred_validator": "qwen3-coder-next",
+        "fallback": ["gemma4-12b", "qwen3.6-35b"],
+        "rationale": "Modèles spécialisés en code Python. qwen3-coder-next est préféré pour sa compréhension fine du code, gemma4-12b en fallback pour la validation de conception."
+      },
+      {
+        "condition": "action == 'chat'",
+        "preferred_validator": "gemma4-12b",
+        "fallback": ["qwen3.6-35b"],
+        "rationale": "Modèles généralistes pour validation conversationnelle. gemma4-12b est préféré pour sa compréhension contextuelle, qwen3.6-35b en fallback pour les cas génériques."
+      },
+      {
+        "condition": "action == 'reason'",
+        "preferred_validator": "gemma4-12b",
+        "fallback": ["qwen3.6-35b", "qwen3-coder-next"],
+        "rationale": "Modèles avec bonnes capacités de raisonnement. gemma4-12b est préféré pour l'analyse logique, qwen3.6-35b en fallback pour le raisonnement complexe."
+      }
+    ],
+    "constraints": [
+      "principle_1 : un seul modèle en VRAM à la fois — le swap modèle prend ~2-4s",
+      "le validateur doit être différent du modèle exécuteur si possible (éviter auto-validation biaisée)",
+      "si le modèle préféré est déjà en VRAM, l'utiliser directement (éviter un swap)",
+      "si aucun modèle n'est disponible, utiliser gemma4-12b comme validateur par défaut (dernier recours)"
+    ]
+  },
+
+  "action_validation_rules": {
+    "code": {
+      "description": "Validation hybride : vérifications déterministes + validation LLM stochastique",
+      "validation_type": "hybrid",
+      "deterministic_checks": [
+        {
+          "id": "DET-CODE-1",
+          "check": "file_exists",
+          "description": "Le fichier spécifié dans file_path existe après écriture",
+          "implementation": "Path(file_path).exists()",
+          "on_fail": "fail",
+          "severity": "critical"
+        },
+        {
+          "id": "DET-CODE-2",
+          "check": "backup_created",
+          "description": "Un fichier .bak.realia a été créé avant écriture",
+          "implementation": "create_backup(p) avant p.write_text() dans execute_step()",
+          "on_fail": "fail",
+          "severity": "critical"
+        },
+        {
+          "id": "DET-CODE-3",
+          "check": "output_not_empty",
+          "description": "L'output de l'étape n'est pas vide",
+          "implementation": "len(output) > 0",
+          "on_fail": "fail",
+          "severity": "critical"
+        },
+        {
+          "id": "DET-CODE-4",
+          "check": "python_syntax",
+          "description": "Si le fichier est un .py, vérifier la syntaxe Python",
+          "implementation": "python -m py_compile <file> (ou ast.parse dans le code)",
+          "on_fail": "fail",
+          "severity": "high",
+          "applicable_if": "file_path.endswith('.py')"
+        },
+        {
+          "id": "DET-CODE-5",
+          "check": "imports_standards",
+          "description": "Vérifier que les imports sont standards (ne pas bloquer sur les imports externes en sandbox)",
+          "implementation": "recherche heuristique des imports dans l'output",
+          "on_fail": "warn",
+          "severity": "low"
+        }
+      ],
+      "stochastic_checks": [
+        {
+          "id": "STO-CODE-1",
+          "check": "llm_validation",
+          "description": "Le validateur sélectionné (competence_based) valide que le code répond à l'instruction et au success_criteria",
+          "validator_selection": "competence_based (voir section validator_selection)",
+          "validator_prompt": "get_validator_prompt(instruction, success_criteria, output, file_path)",
+          "prompt_truncation": "output tronqué à 2000 caractères (défini dans validator_template.py ligne 84)",
+          "on_fail": "fail_with_feedback",
+          "on_pass": "transition VALIDATE → NEXT_STEP"
+        }
+      ],
+      "short_circuit": false,
+      "notes": "Les vérifications déterministes sont exécutées EN PREMIER, avant l'appel LLM. Si une check critique échoue (DET-CODE-1 à DET-CODE-3), la validation LLM n'est pas appelée."
+    },
+
+    "chat": {
+      "description": "Validation stochastique uniquement, avec court-circuit pour les réponses non vides",
+      "validation_type": "stochastic",
+      "deterministic_checks": [],
+      "stochastic_checks": [
+        {
+          "id": "STO-CHAT-1",
+          "check": "llm_validation",
+          "description": "Le validateur sélectionné (competence_based) valide que la réponse est pertinente et satisfait le critère de succès",
+          "validator_selection": "competence_based (voir section validator_selection)",
+          "validator_prompt": "get_validator_prompt(instruction, success_criteria, output)",
+          "prompt_truncation": "output tronqué à 2000 caractères",
+          "on_fail": "fail_with_feedback",
+          "on_pass": "transition VALIDATE → NEXT_STEP"
+        }
+      ],
+      "short_circuit": {
+        "id": "SCC-CHAT-1",
+        "condition": "action == 'chat' AND len(output) > 0",
+        "description": "Si l'action est 'chat' et que l'output n'est pas vide, la validation est implicite (pas d'appel LLM)",
+        "rationale": "Éviter des appels LLM coûteux pour des réponses triviales (salutations, accusés de réception, etc.)",
+        "output": {
+          "status": "pass",
+          "feedback": "Réponse produite (validation implicite)"
+        },
+        "override": true
+      }
+    },
+
+    "reason": {
+      "description": "Validation stochastique uniquement, sans court-circuit",
+      "validation_type": "stochastic",
+      "deterministic_checks": [],
+      "stochastic_checks": [
+        {
+          "id": "STO-REASON-1",
+          "check": "llm_validation",
+          "description": "Le validateur sélectionné (competence_based) valide que le raisonnement est cohérent, logique et répond au critère de succès",
+          "validator_selection": "competence_based (voir section validator_selection)",
+          "validator_prompt": "get_validator_prompt(instruction, success_criteria, output)",
+          "prompt_truncation": "output tronqué à 2000 caractères",
+          "on_fail": "fail_with_feedback",
+          "on_pass": "transition VALIDATE → NEXT_STEP"
+        }
+      ],
+      "short_circuit": false,
+      "notes": "Les étapes 'reason' ne court-circuitent jamais la validation : même un output long doit être validé pour garantir la cohérence du raisonnement."
+    }
+  },
+
+  "retry_rules": {
+    "description": "Règles régissant la transition LOOP → VALIDATE (retry d'une étape après échec de validation)",
+    "max_retries_per_step": 3,
+    "retry_condition": "validation.status == 'fail'",
+    "retry_action": "inject_fix_instruction",
+    "fix_instruction_source": "validation.suggested_fix (champ retourné par le validateur)",
+    "fix_injection_method": "instruction += f'\\n\\n[FEEDBACK CORRECTION]\\n{suggested_fix}'",
+    "attempt_tracking": {
+      "total_retries": "self.loop_count (incrémenté à chaque entrée dans le bloc if attempt > 0)",
+      "per_step_attempts": "attempt (compteur local, incrémenté après chaque exécution, première tentative incluse)",
+      "loop_condition": "while not step_passed AND attempt <= max_retries_per_step"
+    },
+    "abandon_condition": "attempt > max_retries_per_step",
+    "abandon_action": "transition LOOP → FAILED, logger SWARM_STEP_FAILED",
+    "max_total_executions": 4,
+    "notes": "La boucle while autorise max_retries_per_step + 1 exécutions par étape (1 première tentative + jusqu'à 3 retries). attempt commence à 0 (première exécution sans correction)."
+  },
+
+  "plan_validation": {
+    "description": "Règles de validation globale du plan après exécution complète",
+    "success_condition": "all_steps_passed == true",
+    "success_output": {
+      "status": "success",
+      "final_output": "Résumé textuel (généré par Gemma4 si > 1 étape, sinon output brut)",
+      "final_summary_trigger": "all_passed == true AND len(plan) > 1"
+    },
+    "partial_condition": "some_steps_passed == true AND some_steps_failed == true",
+    "partial_output": {
+      "status": "partial",
+      "final_output": "Résumé textuel listant les étapes réussies et échouées"
+    },
+    "failed_condition": "all_steps_failed == true OR critical_step_failed == true OR plan_generation_failed == true",
+    "failed_output": {
+      "status": "failed",
+      "final_output": "Message d'erreur ou rapport d'échec"
+    },
+    "critical_steps": [
+      {
+        "id": "CRIT-1",
+        "description": "Étapes avec action='code' qui modifient des fichiers système",
+        "condition": "action == 'code' AND file_path matches '/etc/*' OR '/usr/*' OR '/var/*'",
+        "impact": "En cas d'échec de validation, la condition de sortie globale devient 'failed' (pas 'partial')",
+        "rationale": "Les modifications système sont irréversibles sans backup"
+      },
+      {
+        "id": "CRIT-2",
+        "description": "Étapes de type 'code' qui échouent après avoir épuisé les retries",
+        "condition": "action == 'code' AND attempt > max_retries_per_step",
+        "impact": "Toutes les étapes dépendantes sont considérées comme non exécutées",
+        "rationale": "Le code invalide peut propager des erreurs aux étapes suivantes (depends_on)"
+      }
+    ]
+  },
+
+  "fallback_rules": {
+    "description": "Règles de fallback lorsque la génération du plan échoue",
+    "trigger_condition": "plan_generation_failed",
+    "trigger_events": [
+      "json.JSONDecodeError lors du parsing de la réponse Gemma4",
+      "plan n'est pas une liste (type inattendu)",
+      "plan est une liste vide"
+    ],
+    "fallback_plan": {
+      "description": "Plan minimal de secours, une seule étape de chat",
+      "steps": [
+        {
+          "step": 1,
+          "model": "gemma4-12b",
+          "action": "chat",
+          "instruction": "Répondre à la demande utilisateur de manière informative",
+          "success_criteria": "réponse produite",
+          "depends_on": null
+        }
+      ]
+    },
+    "fallback_status": "failed",
+    "notes": "Le plan de secours permet au système de répondre même si le planificateur est défaillant. Le modèle utilisé est gemma4-12b (dernier recours, toujours disponible)."
+  },
+
+  "intermediate_step_rules": {
+    "description": "Règles pour les étapes intermédiaires (step + 0.5) générées par le statut 'next'",
+    "trigger_condition": "validation.status == 'next'",
+    "trigger_events": [
+      "Le validateur a détecté qu'une étape supplémentaire mineure est nécessaire",
+      "next_step_instruction est fourni dans la réponse de validation"
+    ],
+    "step_numbering": {
+      "pattern": "step_num_parent + 0.5",
+      "example": "Étape 2 → étape intermédiaire 2.5",
+      "rationale": "L'incrément de 0.5 permet d'insérer une étape sans renuméroter le plan"
+    },
+    "validation_process": {
+      "description": "L'étape intermédiaire est exécutée, puis l'étape PARENTE est re-validée (pas l'intermédiaire)",
+      "steps": [
+        "Créer une étape avec step = step_num + 0.5, model et action identiques à l'étape parente",
+        "Exécuter l'étape intermédiaire via execute_step()",
+        "Re-valider l'ÉTAPE PARENTE (pas l'intermédiaire) avec le nouvel output",
+        "Le résultat de la re-validation détermine step_passed"
+      ]
+    },
+    "merge_rule": "L'output de l'étape intermédiaire est fusionné dans le résultat de l'étape parente (step_results[step_num_parent])",
+    "retry_rules": "L'étape intermédiaire NE compte PAS comme une retry (attempt n'est pas incrémenté)",
+    "edge_cases": [
+      {
+        "condition": "next_step_instruction est vide ou null",
+        "action": "step_passed = true (traitement silencieux)",
+        "rationale": "Si le validateur dit 'next' sans instruction, on considère l'étape comme passée"
+      }
+    ]
+  },
+
+  "decision_matrix": {
+    "description": "Table de correspondance entre les transitions de la state machine (Partie 2) et les règles de validation (Partie 3)",
+    "transitions": [
+      {
+        "transition_id": "TR-PLAN-1",
+        "from_state": "PLAN",
+        "to_state": "EXECUTE",
+        "event": "plan_generated",
+        "validation_type": "deterministic",
+        "validation_rules": [
+          {
+            "id": "V-PLAN-1",
+            "check": "plan_is_valid_json",
+            "description": "La réponse de Gemma4 est un JSON valide",
+            "implementation": "json.loads(normalize_plan_output(raw_plan))",
+            "on_fail": "transition PLAN → FAILED (avec fallback_plan comme filet de sécurité)"
+          },
+          {
+            "id": "V-PLAN-2",
+            "check": "plan_is_array",
+            "description": "Le JSON parsé est une liste (array)",
+            "implementation": "isinstance(plan, list)",
+            "on_fail": "fallback_plan (plan minimal 1 étape chat)"
+          },
+          {
+            "id": "V-PLAN-3",
+            "check": "plan_not_empty",
+            "description": "La liste a au moins 1 élément",
+            "implementation": "len(plan) > 0",
+            "on_fail": "fallback_plan (plan minimal 1 étape chat)"
+          },
+          {
+            "id": "V-PLAN-4",
+            "check": "schema_part1",
+            "description": "Chaque étape respecte le schema de la Partie 1 (step, action, model, instruction)",
+            "implementation": "vérification des champs requis (step, action, model, instruction)",
+            "on_fail": "fallback_plan (plan minimal 1 étape chat)"
+          },
+          {
+            "id": "V-PLAN-5",
+            "check": "model_in_config_map",
+            "description": "Le modèle de chaque étape existe dans config_map (ou sera résolu en fallback realia_dev)",
+            "implementation": "config_map.get(model, 'realia_dev')",
+            "on_fail": "warn (le fallback realia_dev est utilisé)",
+            "severity": "low"
+          },
+          {
+            "id": "V-PLAN-6",
+            "check": "max_5_steps",
+            "description": "Le plan ne dépasse pas 5 étapes (contrainte du prompt système planner_template)",
+            "implementation": "len(plan) <= 5 (prompt engineering, pas de validation code)",
+            "on_fail": "warn (contournement possible si Gemma4 ne respecte pas la consigne)",
+            "severity": "low"
+          }
+        ]
+      },
+
+      {
+        "transition_id": "TR-EXEC-1",
+        "from_state": "EXECUTE",
+        "to_state": "VALIDATE",
+        "event": "execution_success (ou execution_failed)",
+        "validation_type": "hybrid (déterministe + stochastique)",
+        "validation_rules": [
+          {
+            "id": "V-EXEC-1",
+            "check": "deterministic_checks",
+            "description": "Exécution des vérifications déterministes selon le type d'action (code : DET-CODE-1 à 5, chat : aucune, reason : aucune)",
+            "implementation": "voir action_validation_rules.{action}.deterministic_checks",
+            "on_fail": "transition immédiate vers VALIDATE avec statut fail (pas de court-circuit)"
+          },
+          {
+            "id": "V-EXEC-2",
+            "check": "swap_success",
+            "description": "Le swap VRAM vers le modèle de l'étape a réussi",
+            "implementation": "swapper.swap(model) retourne True",
+            "on_fail": "warn (l'étape continue avec le modèle actuel si swap échoue)",
+            "severity": "low"
+          },
+          {
+            "id": "V-EXEC-3",
+            "check": "backup_created",
+            "description": "Pour action=code, un backup .bak.realia a été créé avant écriture",
+            "implementation": "create_backup(p) avant p.write_text()",
+            "on_fail": "fail (sécurité : ne pas écrire sans backup)",
+            "severity": "critical"
+          }
+        ]
+      },
+
+      {
+        "transition_id": "TR-VAL-1",
+        "from_state": "VALIDATE",
+        "to_state": "NEXT_STEP",
+        "event": "validation_pass",
+        "validation_type": "stochastic (LLM) — sauf si court-circuité par short_circuit chat",
+        "validation_rules": [
+          {
+            "id": "V-VAL-1",
+            "check": "llm_or_short_circuit",
+            "description": "Le validateur (competence_based) a retourné status='pass', OU le court-circuit chat s'est déclenché",
+            "implementation": "validation.get('status') == 'pass' OR (action == 'chat' AND len(output) > 0)",
+            "on_fail": "transition VALIDATE → LOOP (status='fail') ou VALIDATE → EXECUTE_NEXT_STEP (status='next')"
+          },
+          {
+            "id": "V-VAL-2",
+            "check": "feedback_non_empty",
+            "description": "Le feedback de validation est présent (même pour le court-circuit chat)",
+            "implementation": "validation.get('feedback', '') != ''",
+            "on_fail": "warn (feedback vide = défaut de parsing JSON)",
+            "severity": "low"
+          }
+        ]
+      },
+
+      {
+        "transition_id": "TR-VAL-2",
+        "from_state": "VALIDATE",
+        "to_state": "LOOP",
+        "event": "validation_fail",
+        "validation_type": "stochastic (LLM)",
+        "validation_rules": [
+          {
+            "id": "V-VAL-3",
+            "check": "fail_with_feedback",
+            "description": "Le validateur a retourné status='fail' avec un feedback et un suggested_fix",
+            "implementation": "validation.get('status') == 'fail'",
+            "on_fail": "Si le status n'est ni 'fail' ni 'pass' ni 'next', traitement heuristique (mots-clés)"
+          },
+          {
+            "id": "V-VAL-4",
+            "check": "attempt_not_exceeded",
+            "description": "Le nombre de tentatives n'a pas dépassé max_retries_per_step (3)",
+            "implementation": "attempt <= max_retries_per_step (condition de la boucle while)",
+            "on_fail": "transition LOOP → FAILED (abandon)"
+          },
+          {
+            "id": "V-VAL-5",
+            "check": "suggested_fix_present",
+            "description": "Un suggested_fix est fourni pour guider la correction",
+            "implementation": "validation.get('suggested_fix', '') != ''",
+            "on_fail": "La correction se fait sans feedback (juste un avertissement 'corrige-toi')",
+            "severity": "medium"
+          }
+        ]
+      },
+
+      {
+        "transition_id": "TR-VAL-3",
+        "from_state": "VALIDATE",
+        "to_state": "EXECUTE_NEXT_STEP",
+        "event": "validation_next",
+        "validation_type": "stochastic (LLM)",
+        "validation_rules": [
+          {
+            "id": "V-VAL-6",
+            "check": "next_with_instruction",
+            "description": "Le validateur a retourné status='next' avec une next_step_instruction",
+            "implementation": "validation.get('status') == 'next' AND validation.get('next_step_instruction', '') != ''",
+            "on_fail": "Si next_step_instruction est vide, transition silencieuse vers NEXT_STEP (step_passed = true)"
+          },
+          {
+            "id": "V-VAL-7",
+            "check": "step_numbering_valid",
+            "description": "Le step_num + 0.5 ne crée pas de collision avec une étape existante",
+            "implementation": "step_num + 0.5 NOT IN [s['step'] for s in plan]",
+            "on_fail": "warn (collision possible, l'étape intermédiaire écrase le résultat)",
+            "severity": "low"
+          }
+        ]
+      },
+
+      {
+        "transition_id": "TR-LOOP-1",
+        "from_state": "LOOP",
+        "to_state": "VALIDATE",
+        "event": "retry_success",
+        "validation_type": "hybrid (exécution corrigée + re-validation)",
+        "validation_rules": [
+          {
+            "id": "V-LOOP-1",
+            "check": "fix_injected",
+            "description": "Le suggested_fix a été injecté dans l'instruction de l'étape",
+            "implementation": "fix_instruction = instruction + '[FEEDBACK CORRECTION]\\n' + suggested_fix",
+            "on_fail": "La correction se fait sans injection (instruction originale inchangée)",
+            "severity": "low"
+          },
+          {
+            "id": "V-LOOP-2",
+            "check": "retry_executed",
+            "description": "L'étape corrigée a été exécutée (execute_step avec corrected_step)",
+            "implementation": "current_output = await self.execute_step(corrected_step, context)",
+            "on_fail": "transition LOOP → FAILED (impossible d'exécuter la correction)"
+          },
+          {
+            "id": "V-LOOP-3",
+            "check": "loop_count_incremented",
+            "description": "Le compteur global de retries a été incrémenté",
+            "implementation": "self.loop_count += 1 (dans le bloc if attempt > 0)",
+            "on_fail": "Le compteur serait inexact (bug connu, fixé dans Phase 2)"
+          }
+        ]
+      },
+
+      {
+        "transition_id": "TR-LOOP-2",
+        "from_state": "LOOP",
+        "to_state": "FAILED",
+        "event": "max_retries_reached",
+        "validation_type": "deterministic",
+        "validation_rules": [
+          {
+            "id": "V-LOOP-4",
+            "check": "attempt_exceeded",
+            "description": "Le nombre de tentatives a dépassé max_retries_per_step",
+            "implementation": "attempt > max_retries_per_step (après incrémentation)",
+            "on_fail": "La boucle while continue (condition encore satisfaite)"
+          },
+          {
+            "id": "V-LOOP-5",
+            "check": "step_still_failed",
+            "description": "L'étape n'a toujours pas passé la validation après toutes les retries",
+            "implementation": "step_passed == false",
+            "on_fail": "La transition ne devrait pas se produire (step_passed = true = aller vers NEXT_STEP)"
+          }
+        ]
+      },
+
+      {
+        "transition_id": "TR-NEXT-1",
+        "from_state": "NEXT_STEP",
+        "to_state": "EXECUTE",
+        "event": "has_next_step",
+        "validation_type": "deterministic",
+        "validation_rules": [
+          {
+            "id": "V-NEXT-1",
+            "check": "next_step_index_valid",
+            "description": "L'index de l'étape suivante est dans les limites du plan",
+            "implementation": "current_step_index + 1 < len(plan)",
+            "on_fail": "transition NEXT_STEP → TERMINATE (plus d'étapes)"
+          },
+          {
+            "id": "V-NEXT-2",
+            "check": "dependency_check",
+            "description": "Vérifier les dépendances (depends_on) de l'étape suivante",
+            "implementation": "for d in depends_on: assert d in self.step_results",
+            "on_fail": "warn SWARM_DEP_MISSING (non bloquant, l'étape continue)"
+          }
+        ]
+      },
+
+      {
+        "transition_id": "TR-NEXT-2",
+        "from_state": "NEXT_STEP",
+        "to_state": "TERMINATE",
+        "event": "no_next_step",
+        "validation_type": "deterministic",
+        "validation_rules": [
+          {
+            "id": "V-NEXT-3",
+            "check": "all_steps_processed",
+            "description": "Toutes les étapes du plan ont été traitées",
+            "implementation": "current_step_index + 1 >= len(plan)",
+            "on_fail": "transition NEXT_STEP → EXECUTE (il reste des étapes)"
+          },
+          {
+            "id": "V-NEXT-4",
+            "check": "step_results_complete",
+            "description": "Toutes les étapes du plan ont un résultat dans step_results",
+            "implementation": "len(self.step_results) >= len(plan)",
+            "on_fail": "warn (résultats manquants pour certaines étapes)"
+          }
+        ]
+      }
+    ]
+  },
+
+  "parsing_fallback_rules": {
+    "description": "Règles de fallback pour le parsing des réponses JSON du validateur et du planificateur",
+    "validator_parsing": {
+      "primary_method": "json.loads(normalize_json_output(raw_validation))",
+      "normalize_json_output": {
+        "steps": [
+          "Essayer d'extraire un bloc ```json ... ```",
+          "Essayer de trouver un objet JSON { ... } dans le texte",
+          "Si trouvé, tenter json.loads()"
+        ]
+      },
+      "heuristic_fallback": {
+        "condition": "json.JSONDecodeError après normalize_json_output",
+        "method": "recherche de mots-clés dans le texte brut",
+        "rules": [
+          {
+            "keywords": ["pass", "ok", "succès", "valid"],
+            "result": {"status": "pass", "feedback": "texte brut tronqué à 200 car."}
+          },
+          {
+            "keywords": ["fail", "erreur", "corrig"],
+            "result": {"status": "fail", "feedback": "texte brut tronqué à 200 car.", "suggested_fix": "texte brut tronqué à 500 car."}
+          },
+          {
+            "default": {"status": "pass", "feedback": "Validation implicite : décision non trouvée dans la réponse"}
+          }
+        ]
+      }
+    },
+    "planner_parsing": {
+      "primary_method": "json.loads(normalize_plan_output(raw_plan))",
+      "normalize_plan_output": {
+        "steps": [
+          "Essayer d'extraire un bloc ```json ... ```",
+          "Essayer de trouver un tableau JSON [ ... ] dans le texte",
+          "Si trouvé, tenter json.loads()"
+        ]
+      },
+      "fallback": {
+        "condition": "json.JSONDecodeError ou plan n'est pas une liste",
+        "result": "fallback_plan (plan minimal 1 étape chat)"
+      }
+    }
+  },
+
+  "overall_execution_flow": {
+    "description": "Vue d'ensemble du flux de validation : quelles règles sont appliquées à chaque étape du cycle PLAN → EXECUTE → VALIDATE → LOOP/TERMINATE",
+    "flow_steps": [
+      {
+        "step": "1. Génération du plan (PLAN)",
+        "validation": "V-PLAN-1 à V-PLAN-6 (déterministe)",
+        "fallback": "fallback_plan si échec de parsing"
+      },
+      {
+        "step": "2. Exécution de l'étape (EXECUTE)",
+        "validation": "V-EXEC-1 à V-EXEC-3 (déterministe)",
+        "notes": "Swap VRAM, cache restore, inference, cache snapshot, backup (si code)"
+      },
+      {
+        "step": "3. Validation de l'étape (VALIDATE)",
+        "validation": "Court-circuit chat SI action='chat' ET output non vide",
+        "or": "V-VAL-1 à V-VAL-7 (stochastique via competence_based routing)"
+      },
+      {
+        "step": "4a. Succès → Étape suivante (NEXT_STEP → EXECUTE)",
+        "validation": "V-NEXT-1 à V-NEXT-2 (déterministe)",
+        "notes": "Vérification des dépendances (non bloquante)"
+      },
+      {
+        "step": "4b. Échec → Correction (LOOP → VALIDATE)",
+        "validation": "V-LOOP-1 à V-LOOP-5 (hybride)",
+        "notes": "Max 3 retries, injection du suggested_fix"
+      },
+      {
+        "step": "4c. Next → Étape intermédiaire (EXECUTE_NEXT_STEP → VALIDATE)",
+        "validation": "step + 0.5, re-validation de l'étape parente"
+      },
+      {
+        "step": "5. Terminaison (TERMINATE / FAILED)",
+        "validation": "Plan validation (success/partial/failed selon les conditions de la section plan_validation)"
+      }
+    ]
+  }
+
+  ],
+  "divergence_note": {
+    "version": "1.0.0",
+    "last_updated": "2026-07-01",
+    "description": "L'implémentation actuelle (v1.0.0) utilise un modèle validateur fixe (PLANNER_MODEL avec config='realia_dev') au lieu du competence-based routing décrit dans ce contrat.",
+    "reason": "Le competence-based routing est prévu pour la v2.0 (Phase 6 — extraction SwarmKit). L'implémentation actuelle est une simplification fonctionnelle.",
+    "impact": "Aucun impact fonctionnel en v1.0.0. Le validateur fonctionne correctement avec le modèle fixe.",
+    "future_work": "Implémenter le competence-based routing dans SwarmKit v2.0 : sélection dynamique du validateur selon le type d'action (code, file, shell, etc.) et les compétences du modèle."
+  }
+}
