@@ -24,6 +24,7 @@ footer { margin-top: auto; }
 <script src="js/perf-profiler.js?v=20250526_v4"></script>
 <script src="js/diff-viewer.js?v=20250526_v4"></script>
 <script src="js/symbol-extractor.js?v=20250526_v4"></script>
+<script src="js/websocket-client.js"></script>
 
 <style>
 /* ── CSS Variables Phase 1 ── */
@@ -747,12 +748,24 @@ function loadFileWithCache(filePath) {
 function invalidateCache(p) { delete fileCache[p]; _cacheOrder = _cacheOrder.filter(x => x !== p); }
 function clearCache() { Object.keys(fileCache).forEach(k => delete fileCache[k]); _cacheOrder = []; document.getElementById('cacheIndicator').textContent = '⏹ Cache vidé'; document.getElementById('cacheIndicator').style.color = '#888'; }
 window.clearCache = clearCache;
-// === UNIQUE WS CLIENT (DevKit) ===
+// === WS TASK CLIENT — feature flags + WebSocket ===
 let wsClient = null;
-const WS_URL = (window.REALIA_CONFIG && window.REALIA_CONFIG.WS_URL) || null; // WS désactivé
+let _useWebSocketCached = null;
+
+async function checkFeatureFlags() {
+  if (_useWebSocketCached !== null) return _useWebSocketCached;
+  try {
+    const r = await fetch(API_BASE + '/config/feature-flags');
+    const cfg = await r.json();
+    _useWebSocketCached = !!cfg.USE_WEBSOCKET;
+  } catch (e) {
+    _useWebSocketCached = false;
+  }
+  return _useWebSocketCached;
+}
 
 function connectWS() {
-  // WS désactivé - les logs passent par fetch REST
+  // Connexion WS globale (monitoring, métriques) : optionnelle, les tâches utilisent checkFeatureFlags()
   updateWsUI(false);
 }
 
@@ -760,11 +773,6 @@ function updateWsUI(connected) {
   const set = (id, txt) => { const el = document.getElementById(id); if (el) el.textContent = txt; };
   set('wsIndicator', connected ? '🔌 🟢 Connecté' : '🔌 🔴 Déconnecté');
   set('dash-ws-label', connected ? '🟢' : '🔴');
-  if (document.getElementById('msDot')) {
-    document.getElementById('msDot').textContent = connected ? '🟢' : '🔴';
-  }
-  // Sync immédiat avec le backend si connecté
-  if (connected) pollStatus();
 }
 
 // Nettoyage avant déchargement
@@ -1060,45 +1068,16 @@ async function triggerVision() {
     }
     const d = await r.json();
     if (d.status === 'queued' && d.task_id) {
-    window._lastPollTaskId = d.task_id;
-      // Polling asynchrone — idempotent : 1 task_id = 1 bloc DOM
       ld.id = 'msg-' + d.task_id;
-      ld.innerHTML = '<div class="sender">🟡 ' + escapeHtml(sm) + '</div><span>En file d\'attente / En cours d\'inf├®rence locale...</span>';
-      var chatContainer = document.getElementById('chatMessages');
-      var pollId = d.task_id;
-      var poll = setInterval(async function() {
-        try {
-          var sr = await fetch(API_BASE + '/api/task/' + pollId + '/status');
-          var sd = await sr.json();
-          if (sd.status === 'completed') {
-            clearInterval(poll);
-            var stepResult = sd.step_results && (sd.step_results.result || sd.step_results.vision || sd.step_results.text);
-            var planOutput = sd.step_results && typeof sd.step_results === 'object' && !Array.isArray(sd.step_results) ? (Object.values(sd.step_results).find(v => v && typeof v === 'object' && v.output) || {}).output : null;
-            var text = stepResult || planOutput;
-            if (text && text.length > 10) {
-              upsertMessage(pollId, '<div class="sender">🟢 ' + escapeHtml(sm) + '</div>' + formatSafeMarkdown(text), chatContainer);
-              STATE.conversationHistory.push({ role: 'user', content: msg }, { role: 'assistant', content: text });
-              if (STATE.conversationHistory.length > 20) STATE.conversationHistory = STATE.conversationHistory.slice(-20);
-              saveChatHistory();
-            }
-          } else if (sd.status === 'failed') {
-            clearInterval(poll);
-            var errMsg = sd.error || 'inconnue';
-            upsertMessage(pollId, '<div class="sender">🔴 ' + escapeHtml(sm) + '</div><span>Erreur: ' + escapeHtml(errMsg) + '</span>', chatContainer);
-            showToast('❌ Vision ├®chou├®e : ' + escapeHtml(errMsg).substring(0, 120), 'error');
-          }
-        } catch (e) { console.error('[POLL] err:', e); clearInterval(poll); }
-      }, 1500);
-      setTimeout(function() {
-        clearInterval(poll);
-        var existing = document.getElementById('msg-' + pollId);
-        if (existing && existing.innerHTML.includes('En cours')) {
-          existing.innerHTML = '<div class="sender">🔴 ' + escapeHtml(sm) + '</div><span>⏱️ Délai dépassé. Réessaie.</span>';
-          STATE.conversationHistory.push({ role: 'user', content: msg }, { role: 'assistant', content: '(timeout)' });
-        }
-            }, 120000);
-  } else {
-    ld.innerHTML = '<div class="sender">🟢 gemma4-e4b</div><span>' + (d.description||d.message||JSON.stringify(d)) + '</span>';
+      ld.innerHTML = '<div class="sender">🟡 vision</div><span>En file d\'attente...</span>';
+      monitorTaskWithWS(d.task_id, ld, 'vision', msg, (result) => {
+        const cm = document.getElementById('chatMessages');
+        upsertMessage(d.task_id, '<div class="sender">🟢 vision</div>' + formatSafeMarkdown(result), cm);
+        STATE.conversationHistory.push({ role: 'user', content: msg }, { role: 'assistant', content: result });
+        saveChatHistory();
+      });
+    } else {
+      ld.innerHTML = '<div class="sender">🟢 gemma4-e4b</div><span>' + (d.description||d.message||JSON.stringify(d)) + '</span>';
     }
   } catch (e) {
     ld.innerHTML = '<div class="sender">RealiaDev</div><span>🔴 Erreur connexion : ' + (e.message || e.natural || 'réessaie') + '</span>';
@@ -1126,6 +1105,118 @@ function upsertMessage(taskId, htmlText, container) {
 }
 
 function addChatMessage(role,text){ const d=document.createElement('div');d.className='msg '+role; if(role==='user')d.innerHTML='<div class="sender">Vous</div>'+formatSafeMarkdown(text); else if(role==='error')d.innerHTML='<div class="sender">Erreur</div>'+formatSafeMarkdown(text); else d.innerHTML='<div class="sender">RealiaDev</div>'+formatSafeMarkdown(text); document.getElementById('chatMessages').appendChild(d);const chat=document.getElementById('chat-container');if(chat)chat.scrollTo({top:chat.scrollHeight,behavior:'auto'}); }
+
+// ── UI Helpers pour progression temps réel ──
+function updateProgressBar(progressPct) {
+  const bar = document.getElementById('progress-bar') || (() => {
+    const div = document.createElement('div'); div.id = 'progress-bar';
+    div.style.cssText = 'height:4px;background:#333;border-radius:2px;margin:4px 12px;overflow:hidden';
+    div.innerHTML = '<div id="progress-fill" style="height:100%;width:0%;background:linear-gradient(90deg,#8B5CF6,#EC4899);border-radius:2px;transition:width .3s ease"></div>';
+    const container = document.getElementById('chat-container');
+    if (container) container.prepend(div);
+    return div;
+  })();
+  const fill = document.getElementById('progress-fill');
+  if (fill) fill.style.width = Math.min(100, Math.max(0, progressPct)) + '%';
+}
+function updateStepInfo(stepName, stepIndex, stepTotal) {
+  const el = document.getElementById('step-info') || (() => {
+    const d = document.createElement('div'); d.id = 'step-info';
+    d.style.cssText = 'font-size:10px;color:#888;padding:2px 12px;text-align:center';
+    const container = document.getElementById('chat-container');
+    if (container) container.prepend(d);
+    return d;
+  })();
+  el.textContent = stepName ? `📋 Étape ${stepIndex}/${stepTotal}: ${stepName}` : '';
+}
+function updateUI(status) {
+  const el = document.getElementById('status-indicator') || (() => {
+    const d = document.createElement('div'); d.id = 'status-indicator';
+    d.style.cssText = 'font-size:10px;padding:2px 12px;text-align:center;font-weight:600';
+    const container = document.getElementById('chat-container');
+    if (container) container.prepend(d);
+    return d;
+  })();
+  const colors = { running: '#ffb74d', completed: '#4caf50', failed: '#f44336' };
+  el.style.color = colors[status] || '#888';
+  el.textContent = status === 'running' ? '🟡 En cours...' : status === 'completed' ? '✅ Terminé' : status === 'failed' ? '🔴 Échec' : '';
+}
+
+// ── MonitorTask : WebSocket avec fallback polling ──
+async function monitorTaskWithWS(taskId, ld, sm, msg, onResult, timeoutMs) {
+  timeoutMs = timeoutMs || 120000;
+  let pollActive = true;
+  const useWS = await checkFeatureFlags();
+  if (useWS) {
+    const wsClient = new RealiaWebSocketClient(taskId, {
+      onStart: () => { if (ld) { ld.innerHTML = '<div class="sender">🟡 ' + escapeHtml(sm) + '</div><span>Démarré...</span>'; } updateUI('running'); },
+      onProgress: (data) => {
+        const pct = data.progress_pct || 0;
+        if (ld) { ld.innerHTML = '<div class="sender">🟡 ' + escapeHtml(sm) + '</div><span>Progression: ' + Math.round(pct) + '%</span>'; }
+        updateProgressBar(pct);
+        updateStepInfo(data.step_name, data.step_index, data.step_total);
+      },
+      onComplete: (data) => {
+        pollActive = false;
+        const result = data.result || data.response || JSON.stringify(data);
+        updateProgressBar(100);
+        updateUI('completed');
+        if (onResult) onResult(result);
+      },
+      onError: (data) => {
+        pollActive = false;
+        const errMsg = data.error || 'inconnue';
+        if (ld) ld.innerHTML = '<div class="sender">🔴 ' + escapeHtml(sm) + '</div><span>Erreur: ' + escapeHtml(errMsg) + '</span>';
+        showToast('❌ Tâche échouée : ' + escapeHtml(errMsg).substring(0, 120), 'error');
+        updateUI('failed');
+      },
+      onFallback: () => {
+        console.warn('[WS] Fallback polling activé pour tâche', taskId);
+        if (pollActive) startFallbackPolling(taskId, ld, sm, msg, onResult);
+      }
+    });
+    await wsClient.connect();
+    setTimeout(() => {
+      if (pollActive) {
+        pollActive = false;
+        wsClient.close();
+        if (ld && ld.innerHTML.includes('🟡')) { ld.innerHTML = '<div class="sender">🔴 ' + escapeHtml(sm) + '</div><span>⏱️ Délai dépassé. Réessaie.</span>'; updateUI('failed'); }
+      }
+    }, timeoutMs);
+    return;
+  }
+  startFallbackPolling(taskId, ld, sm, msg, onResult);
+}
+
+function startFallbackPolling(taskId, ld, sm, msg, onResult) {
+  const interval = setInterval(async () => {
+    try {
+      const sr = await fetch(API_BASE + '/api/task/' + taskId + '/status', { signal: AbortSignal.timeout(10000) });
+      const sd = await sr.json();
+      if (sd.status === 'completed') {
+        clearInterval(interval);
+        const stepResult = sd.step_results && (sd.step_results.result || sd.step_results.vision || sd.step_results.text);
+        const planOutput = sd.step_results && typeof sd.step_results === 'object' && !Array.isArray(sd.step_results)
+          ? (Object.values(sd.step_results).find(v => v && typeof v === 'object' && v.output) || {}).output : null;
+        const result = stepResult || planOutput || sd.response || sd.message || (sd.model_used ? "✅ Terminé." : JSON.stringify(sd));
+        updateProgressBar(100);
+        updateUI('completed');
+        if (onResult) onResult(result);
+        else if (ld) ld.innerHTML = '<div class="sender">🟢 ' + escapeHtml(sm) + '</div>' + formatSafeMarkdown(result);
+      } else if (sd.status === 'failed') {
+        clearInterval(interval);
+        const errMsg = sd.error || 'inconnue';
+        if (ld) ld.innerHTML = '<div class="sender">🔴 ' + escapeHtml(sm) + '</div><span>Erreur: ' + escapeHtml(errMsg) + '</span>';
+        showToast('❌ Tâche échouée : ' + escapeHtml(errMsg).substring(0, 120), 'error');
+        updateUI('failed');
+      }
+    } catch (e) { console.error('[POLL] err:', e); clearInterval(interval); }
+  }, 1500);
+  setTimeout(() => {
+    clearInterval(interval);
+    if (ld && ld.innerHTML.includes('🟡')) { ld.innerHTML = '<div class="sender">🔴 ' + escapeHtml(sm) + '</div><span>⏱️ Délai dépassé. Réessaie.</span>'; updateUI('failed'); }
+  }, 120000);
+}
 
 // ── Vérification de connectivité backend ──
 async function checkBackend() {
@@ -1267,39 +1358,16 @@ function toggleChatTools() {
     const d = await r.json();
     window._lastPollTaskId = d.task_id;
     if (d.status === 'queued' && d.task_id) {
-      // Polling asynchrone
-      ld.innerHTML = '<div class="sender">🟡 ' + escapeHtml(sm) + '</div><span>En file d\'attente / En cours d\'inf├®rence locale...</span>';
-      const poll = setInterval(async () => {
-        try {
-          const sr = await fetch(API_BASE + '/api/task/' + d.task_id + '/status', { signal: AbortSignal.timeout(10000) });
-          const sd = await sr.json();
-          if (sd.status === 'completed') {
-            clearInterval(poll);
-            const stepResult = sd.step_results && (sd.step_results.result || sd.step_results.vision || sd.step_results.text);
-            const planOutput = sd.step_results && typeof sd.step_results === 'object' && !Array.isArray(sd.step_results) ? (Object.values(sd.step_results).find(v => v && typeof v === 'object' && v.output) || {}).output : null;
-            const result = stepResult || planOutput || sd.response || sd.message || (sd.model_used ? "✅ Terminé." : JSON.stringify(sd));
-            ld.innerHTML = '<div class="sender">🟢 ' + escapeHtml(sm) + '</div>' + formatSafeMarkdown(result);
-            ld.scrollIntoView({ behavior: 'smooth' });
-            STATE.conversationHistory.push({ role: 'user', content: msg }, { role: 'assistant', content: result });
-            if (STATE.conversationHistory.length > 20) STATE.conversationHistory = STATE.conversationHistory.slice(-20);
-            saveChatHistory();
-          } else if (sd.status === 'failed') {
-            clearInterval(poll);
-            var errMsg = sd.error || 'inconnue';
-            ld.innerHTML = '<div class="sender">🔴 ' + escapeHtml(sm) + '</div><span>Erreur: ' + escapeHtml(errMsg) + '</span>';
-            showToast('❌ T├óche ├®chou├®e : ' + escapeHtml(errMsg).substring(0, 120), 'error');
-          }
-          // else still 'queued' / 'running' → continue polling
-        } catch (e) { console.error('[POLL] err:', e); clearInterval(poll); }
-      }, 1500);
-      setTimeout(() => {
-        // Timeout 30s
-        clearInterval(poll);
-        if (ld && ld.innerHTML.includes('En cours')) {
-          ld.innerHTML = '<div class="sender">🔴 ' + escapeHtml(sm) + '</div><span>⏱️ Délai dépassé. Réessaie.</span>';
-          STATE.conversationHistory.push({ role: 'user', content: msg }, { role: 'assistant', content: '(timeout)' });
-        }
-            }, 120000);
+      // Polling → WebSocket avec fallback
+      ld.innerHTML = '<div class="sender">🟡 ' + escapeHtml(sm) + '</div><span>En file d\'attente...</span>';
+      window._lastPollTaskId = d.task_id;
+      monitorTaskWithWS(d.task_id, ld, sm, msg, (result) => {
+        ld.innerHTML = '<div class="sender">🟢 ' + escapeHtml(sm) + '</div>' + formatSafeMarkdown(result);
+        ld.scrollIntoView({ behavior: 'smooth' });
+        STATE.conversationHistory.push({ role: 'user', content: msg }, { role: 'assistant', content: result });
+        if (STATE.conversationHistory.length > 20) STATE.conversationHistory = STATE.conversationHistory.slice(-20);
+        saveChatHistory();
+      });
   } else {
     // Réponse synchrone (fallback)
       let reply = d.text || d.response || d.message || JSON.stringify(d);
@@ -1436,490 +1504,4 @@ function restoreSession() {
     // Editor
     if (s.editor && s.editor.path) {
       STATE.currentPath = s.editor.path;
-      STATE.currentContent = s.editor.content || '';
-      document.getElementById('currentFile').textContent = '📄 ' + s.editor.path;
-      const active = 'left';
-      paneState[active].path = s.editor.path;
-      paneState[active].content = s.editor.content || '';
-      const ta = document.getElementById('pane-left-textarea');
-      if (ta) { ta.value = s.editor.content || ''; ta.style.display = 'block'; }
-    }
-    // UI - restaurer sidebar state
-    if (s.ui) {
-      if (s.ui.model) { const ms = document.getElementById('modelSelect'); if (ms) ms.value = s.ui.model; }
-      if (s.ui.sidebar) Object.entries(s.ui.sidebar).forEach(([id, state]) => {
-        const sec = document.getElementById(id);
-        if (sec) sec.classList.toggle('collapsed', state === 'collapsed');
-      });
-    }
-    showToast('✅ Session restaurée', 'success');
-  } catch (e) { /* silencieux */ }
-}
-function clearSession() {
-  localStorage.removeItem('realiaSession');
-  STATE.conversationHistory = [];
-  document.getElementById('chatMessages').innerHTML = '';
-  STATE.currentPath = ''; STATE.currentContent = '';
-  document.getElementById('currentFile').textContent = 'Aucun fichier';
-  showToast('🗑️ Session effacée', 'info');
-}
-window.clearSession = clearSession;
-
-function saveChatHistory(){if(!STATE.conversationHistory.length)return;const s=JSON.parse(localStorage.getItem('realiaChatHistory')||'[]');s.unshift({id:Date.now(),date:new Date().toISOString(),history:JSON.parse(JSON.stringify(STATE.conversationHistory))});if(s.length>5)s.length=5;localStorage.setItem('realiaChatHistory',JSON.stringify(s));}
-function toggleHistory(){const dd=document.getElementById('historyDropdown');if(dd.style.display==='block'){dd.style.display='none';return;}const s=JSON.parse(localStorage.getItem('realiaChatHistory')||'[]');if(!s.length)dd.innerHTML='<div style="padding:8px;color:#888;font-size:12px">Aucun historique</div>';else dd.innerHTML=s.map(x=>'<div onclick="loadHistory(\''+x.id+'\')" style="padding:8px 10px;cursor:pointer;border-bottom:1px solid #333;font-size:12px" onmouseover="this.style.background=\'#333\'" onmouseout="this.style.background=\'\'"><div style="color:#888;font-size:11px">'+new Date(x.date).toLocaleString('fr-FR')+'</div><div style="color:#ccc">'+escapeHtml((x.history[0]?.content||'').slice(0,40))+'…</div></div>').join('');dd.style.display='block';}
-function loadHistory(id){const s=JSON.parse(localStorage.getItem('realiaChatHistory')||'[]');const ses=s.find(x=>x.id==id);if(!ses)return;STATE.conversationHistory=JSON.parse(JSON.stringify(ses.history));document.getElementById('chatMessages').innerHTML='';for(const m of STATE.conversationHistory)addChatMessage(m.role==='user'?'user':'agent',m.content);document.getElementById('historyDropdown').style.display='none';}
-function exportChat(){if(!STATE.conversationHistory.length){showToast('Rien à exporter.','info');return;}let md='# Conversation RealiaDev — '+new Date().toLocaleString('fr-FR')+'\n\n';for(const m of STATE.conversationHistory){md+='### '+(m.role==='user'?'**Vous**':'**RealiaDev**')+'\n'+m.content+'\n\n';}const b=new Blob([md],{type:'text/markdown'});const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='realia-chat-'+Date.now()+'.md';a.click();URL.revokeObjectURL(a.href);}
-
-document.addEventListener('click',e=>{const dd=document.getElementById('historyDropdown');if(dd&&dd.style.display==='block'&&!e.target.closest('#toolbar div'))dd.style.display='none';});
-function toggleMenu(e,id){e.stopPropagation();document.querySelectorAll('.menu-dropdown').forEach(m=>{if(m.id!==id)m.parentElement.classList.remove('open');});e.currentTarget.classList.toggle('open');}
-document.addEventListener('click',()=>{document.querySelectorAll('.menu-item.open').forEach(el=>el.classList.remove('open'));},{capture:true});
-function newFile(){STATE.currentPath='';STATE.currentContent='';const ta=document.querySelector('.editor-pane.focused .pane-textarea');if(ta){ta.value='';ta.disabled=false;ta.style.display='block';}document.getElementById('currentFile').textContent='Nouveau fichier';if(ta)ta.focus();}
-function openFile(){const fi=document.createElement('input');fi.type='file';fi.accept='.py,.html,.js,.json,.md,.yaml,.yml,.css,.txt,.sh,.ts,.toml,.env,.xml,.sql,.vue,.svelte';fi.onchange=async e=>{const f=e.target.files[0];if(!f)return;const t=await f.text();const active=paneState.left.active?'left':'right';const p=paneState[active];p.path=f.name;p.content=t;const ta=document.getElementById('pane-'+active+'-textarea');if(ta){ta.value=t;ta.style.display='block';}document.getElementById('currentFile').textContent='📄 '+f.name;};fi.click();}
-function quitApp(){showToast('🚪 Quitter ?','info',()=>window.close());}
-function toggleSearch(){const ta=document.querySelector('.editor-pane.focused .pane-textarea');if(!ta||ta.style.display==='none')return;showToast('🔍 Rechercher ? Saisir puis entrer dans le champ.','info');ta.focus();}
-function toggleTheme(){document.body.style.filter=document.body.style.filter==='invert(1)'?'':'invert(1)';addChatMessage('agent','🌓 Thème basculé');}
-function toggleFullscreen(){if(document.fullscreenElement)document.exitFullscreen();else document.body.requestFullscreen?.();}
-function showAbout(){showToast('⚡ RealiaDevKit v2.0 — Station Realia','info');}
-
-function openDocs(){window.open(API_BASE+'/health','_blank');}
-
-let isResizing=false,currentResizeHandle=null,startX,startWidths;
-document.querySelectorAll('.resize-handle').forEach(h=>{h.addEventListener('mousedown',e=>{isResizing=true;currentResizeHandle=h;startX=e.clientX;const sb=document.getElementById('sidebar'),ch=document.getElementById('chat');startWidths=h.id==='rh0'?{left:sb.offsetWidth}:{right:ch.offsetWidth};document.body.style.cursor='col-resize';document.body.style.userSelect='none';});});
-document.addEventListener('mousemove',e=>{if(!isResizing||!currentResizeHandle)return;const dx=e.clientX-startX;const sb=document.getElementById('sidebar'),ch=document.getElementById('chat'),ed=document.getElementById('editor'),total=sb.offsetWidth+ed.offsetWidth+ch.offsetWidth;if(currentResizeHandle.id==='rh0'){let nw=Math.max(100,Math.min(total-ch.offsetWidth-100,startWidths.left+dx));sb.style.width=nw+'px';}else{let nw=Math.max(100,Math.min(total-sb.offsetWidth-100,startWidths.right-dx));ch.style.width=nw+'px';}});
-
-document.addEventListener('mouseup',()=>{if(isResizing){isResizing=false;currentResizeHandle=null;document.body.style.cursor='';document.body.style.userSelect='';}});
-// ── Starfield Canvas ──
-(function initStarfield() {
-  const c = document.getElementById('starfield');
-  if (!c) return;
-  const ctx = c.getContext('2d');
-  let stars = [], w, h;
-  function resize() { w = c.width = window.innerWidth; h = c.height = window.innerHeight; }
-  window.addEventListener('resize', resize); resize();
-  const STAR_COUNT = 180;
-  for (let i = 0; i < STAR_COUNT; i++) {
-    stars.push({ x: Math.random() * w, y: Math.random() * h, r: Math.random() * 1.5 + 0.3, a: Math.random() * 0.6 + 0.2, s: Math.random() * 0.15 + 0.02 });
-  }
-  function draw() {
-    ctx.clearRect(0, 0, w, h);
-    for (const s of stars) {
-      ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
-      ctx.fillStyle = `rgba(255,255,255,${s.a})`; ctx.fill();
-      s.y -= s.s;
-      if (s.y < -5) { s.y = h + 5; s.x = Math.random() * w; }
-    }
-    requestAnimationFrame(draw);
-  }
-  draw();
-})();
-
-// ── Auto-diagnostic UI (overlay bloquant) ──
-function checkUIAccessibility() {
-  const input = document.getElementById('user-input');
-  if (!input) return;
-  const rect = input.getBoundingClientRect();
-  const cx = rect.left + rect.width / 2, cy = rect.top + rect.height / 2;
-  const topEl = document.elementFromPoint(cx, cy);
-  if (topEl && topEl !== input && !input.contains(topEl)) {
-    const fixedEl = topEl.closest('[style*="fixed"]') || topEl.closest('[style*="absolute"]');
-    if (fixedEl && fixedEl.id !== 'toast-container') {
-      fixedEl.style.pointerEvents = 'none';
-      fixedEl.setAttribute('aria-hidden', 'true');
-      console.debug('[AutoDiagnostic] Overlay ajusté :', fixedEl.id || fixedEl.tagName);
-      showToast('🔧 Overlay ajusté pour accessibilité', 'info');
-    }
-  }
-}
-// ── Parsing adaptatif réponse agent ──
-function parseAgentResponse(d) {
-  return (d.choices?.[0]?.text || d.choices?.[0]?.message?.content || d.content || '').trim();
-}
-// ── DevKit-Observability : poller /status toutes les 5s ──
-async function pollStatus() {
-  try {
-    const res = await fetch(API_BASE+'/status', { signal: AbortSignal.timeout(3000) });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const s = await res.json();
-
-    // Helper mise à jour sécurisée
-    const set = (id, txt) => { const el = document.getElementById(id); if (el) el.textContent = txt; };
-
-    // Santé granulaire : composants individuels
-    if (s.health_components) {
-      const comps = Object.entries(s.health_components)
-        .map(([k,v]) => `${k}:${v==='ok'?'🟢':'🔴'}`)
-        .join(' ');
-      set('dash-health-label', `${s.health==='healthy'?'🟢':'🟡'} ${comps}`);
-    } else {
-      set('dash-health-label', s.health === 'healthy' ? '🟢 Nominal' : '🟡 En maintenance...');
-    }
-
-    // Modèle : utiliser active_model si dispo, fallback model
-    const modelName = s.active_model && s.active_model !== 'none' ? s.active_model : (s.model || 'gemma4-e4b');
-    set('msName', `🧠 ${modelName}`);
-
-    // Cache : taille réelle en MB + ratio VRAM
-    if (s.cache?.size_mb !== undefined) {
-      const ratio = s.cache.ratio_percent || 0;
-      const vram = s.cache.vram_total_mb || 0;
-      set('dash-cache-label', `⚡ ${s.cache.size_mb} MB / ${vram} MB (${ratio}%)`);
-    } else {
-      set('dash-cache-label', s.cache_active === true ? '⚡ Actif' : '⏹ Inactif');
-    }
-
-    // VRAM
-    if (s.gpu?.vram_used_mb && s.gpu?.vram_total_mb) {
-      const used = Math.round(s.gpu.vram_used_mb / 1024);
-      const total = Math.round(s.gpu.vram_total_mb / 1024);
-      set('dash-vram-label', `💾 ${used} GB / ${total} GB`);
-    } else {
-      set('dash-vram-label', '💾 VRAM : inconnu');
-    }
-
-    // WebSocket via wsIndicator
-    const wsOk = (wsClient !== null && wsClient.readyState === 1) || s.ws_connected === true;
-    const wsEl = document.getElementById('wsIndicator');
-    if (wsEl) wsEl.textContent = wsOk ? '🔌 🟢 Connecté' : '🔌 🔴 Déconnecté';
-
-    // msDot : état vision
-    const dot = document.getElementById('msDot');
-    if (dot) dot.className = 'ms-dot ' + (s.vision ? 'green' : 'yellow');
-
-    // Badges capacités : clés backend → IDs DOM existants
-    const badges = { vision: 'cap-vision', terminal: 'cap-terminal', fichiers: 'cap-fichiers', rag: 'cap-rag' };
-    const backendTools = s.tools || [];
-    for (const [tool, id] of Object.entries(badges)) {
-      const el = document.getElementById(id);
-      if (el) el.classList.toggle('inactive', !backendTools.includes(tool));
-    }
-
-  } catch(e) {
-    // Erreur visible dans le chat (pas console)
-    if (typeof console !== 'undefined') {
-      console.debug('[Status]', e.message);
-    }
-  }
-}
-// Premier appel immédiat + intervalle
-pollStatus();
-setInterval(pollStatus, 5000);
-
-// ── Notification mode réseau ──
-function notifyNetworkMode(mode) {
-  if (mode === 'polling') {
-    addChatMessage('agent', '📡 Mode réseau adapté : connexion stable via HTTP polling. Aucune action requise.');
-    setTimeout(() => {
-      addChatMessage('agent', 'Souhaitez-vous que je teste la disponibilité du WebSocket ?');
-    }, 3000);
-  }
-}
-window.notifyNetworkMode = notifyNetworkMode;
-
-(function init() {
-  loadFiles(); checkHealth(); loadModels(); checkUIAccessibility();
-  restoreSession();
-  // ★ BUG 1 : Forcer toutes les sections sidebar en collapsed après restoreSession
-  document.querySelectorAll('.sidebar-section').forEach(sec => sec.classList.add('collapsed'));
-  // ★ BUG 3 : Forcer modelSelect en dernière instruction — rien après ne l'écrase
-  const ms = document.getElementById('modelSelect');
-  if (ms) { ms.value = 'utu-realiamdev'; }
-  // ★ BUG 4 : Si le dashboard affiche encore — en init on ne touche pas, c'est déjà "🟡 En attente..."
-  // La mise à jour se fait via checkHealth()/loadModels() appelés plus haut
-  setInterval(checkHealth,10000); setInterval(loadModels,15000);
-  setInterval(checkUIAccessibility,5000);
-  setInterval(autoSaveSession, 60000);
-  if (typeof initAllPanels === 'function') initAllPanels();
-  if (typeof initSplitView === 'function') initSplitView();
-})();
-</script>
-
-<!-- 🔄 POLLING UX v2.4 — extraction step_results.text -->
-<script>
-(function() {
-  'use strict';
-  if (window._pollingUXv24) return;
-  window._pollingUXv24 = true;
-  console.log('[PollingUX v2.4] Extraction step_results.text active');
-
-  var POLL_INTERVAL = 1500;
-  var API_QUEUE = location.origin + '/agent/swarm/queue';
-  var lastSeenText = null;
-
-  function cleanText(t) {
-    if (typeof t !== 'string') return t;
-    return t.replace(/\n{3,}/g, '\n\n').trim();
-  }
-
-  function extractText(data) {
-    if (!data || typeof data !== 'object') return null;
-
-    if (data.step_results && typeof data.step_results === 'object') {
-      if (data.step_results.result && typeof data.step_results.result === 'string' && data.step_results.result.trim()) {
-        return cleanText(data.step_results.result);
-      }
-      if (data.step_results.text && typeof data.step_results.text === 'string' && data.step_results.text.trim() && data.step_results.text !== 'no_text_output') {
-        return cleanText(data.step_results.text);
-      }
-      if (data.step_results.final_answer && typeof data.step_results.final_answer === 'string' && data.step_results.final_answer.trim()) {
-        return cleanText(data.step_results.final_answer);
-      }
-      if (data.step_results.output && typeof data.step_results.output === 'string' && data.step_results.output.trim()) {
-        return cleanText(data.step_results.output);
-      }
-      // PlanExecutor: step_results.{step}.output
-      var srKeys = Object.keys(data.step_results);
-      for (var ei = 0; ei < srKeys.length; ei++) {
-        var stepVal = data.step_results[srKeys[ei]];
-        if (stepVal && typeof stepVal === 'object' && stepVal.output && typeof stepVal.output === 'string' && stepVal.output.trim()) {
-          return cleanText(stepVal.output);
-        }
-      }
-    }
-
-    if (data.current_task && data.current_task.step_results && typeof data.current_task.step_results === 'object') {
-      var sr = data.current_task.step_results;
-      if (sr.text && typeof sr.text === 'string' && sr.text.trim() && sr.text !== 'no_text_output') {
-        return cleanText(sr.text);
-      }
-      if (sr.final_answer && typeof sr.final_answer === 'string' && sr.final_answer.trim()) {
-        return cleanText(sr.final_answer);
-      }
-      if (sr.output && typeof sr.output === 'string' && sr.output.trim()) {
-        return cleanText(sr.output);
-      }
-    }
-
-    if (data.final_answer && typeof data.final_answer === 'string') return cleanText(data.final_answer);
-    if (data.output && typeof data.output === 'string') return cleanText(data.output);
-    if (data.response && typeof data.response === 'string') return cleanText(data.response);
-    if (data.text && typeof data.text === 'string') return cleanText(data.text);
-    if (data.message && typeof data.message === 'string') return cleanText(data.message);
-    if (data.result && typeof data.result === 'string') return cleanText(data.result);
-
-    return null;
-  }
-
-  function addAssistantMessage(text) {
-    if (!text || typeof text !== 'string' || !text.trim()) return false;
-
-    // Deduplication: ne pas réafficher le même texte
-    if (text.trim() === lastSeenText) return false;
-    lastSeenText = text.trim();
-
-    var container = document.getElementById('chatMessages');
-    if (!container) return false;
-
-    // Deduplication DOM: verifier si le texte est deja affiche
-    var existingMsgs = container.querySelectorAll('.msg.agent, .msg.user');
-    for (var ei = 0; ei < existingMsgs.length; ei++) {
-      if (existingMsgs[ei].textContent && existingMsgs[ei].textContent.trim().indexOf(text.trim().slice(0, 30)) !== -1) {
-        return false;
-      }
-    }
-
-    var div = document.createElement('div');
-    div.className = 'msg agent';
-    div.setAttribute('aria-live', 'polite');
-    div.innerHTML = '<div class="sender">RealiaDev</div>' + text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/\`([^\`]+)\`/g, '<code>$1</code>').replace(/\n/g, '<br>');
-
-    container.appendChild(div);
-    var chat = document.getElementById('chat-container');
-    if (chat) chat.scrollTo({ top: chat.scrollHeight, behavior: 'smooth' });
-
-    // Supprimer le message "loading dots" précédent s'il existe
-    var msgs = container.querySelectorAll('.msg.agent');
-    if (msgs.length >= 2) {
-      var prev = msgs[msgs.length - 2];
-      if (prev && prev.innerHTML.indexOf('loading-dots') !== -1) {
-        prev.remove();
-      }
-    }
-
-    return true;
-  }
-
-  function addFallbackMessage() {
-    addAssistantMessage('⚠️ Réponse technique. Vérifie les logs WebSocket (:8093).');
-  }
-
-  function pollQueue() {
-    if (!window._lastPollTaskId) return;
-    fetch(API_BASE + '/api/task/' + window._lastPollTaskId + '/status', { signal: AbortSignal.timeout(120000) })
-      .then(function(r) {
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        return r.json();
-      })
-      .then(function(data) {
-        var text = extractText(data);
-
-        // DevSenior: sendMessage/triggerVision gerent deja l'affichage
-        // PollingUX ne fait que les fallbacks (pas de texte)
-        if (text) {
-          return;  // deja affiche par sendMessage/triggerVision
-        } else if (data.step_results && data.step_results.error === 'no_text_output') {
-          // Fallback salutation
-          var taskStr = '';
-          if (data.current_task && data.current_task.task && typeof data.current_task.task === 'string') {
-            taskStr = data.current_task.task;
-          } else if (data.last_trace && typeof data.last_trace === 'string') {
-            taskStr = data.last_trace;
-          }
-          taskStr = taskStr.toLowerCase();
-          if (taskStr.match(/(bjr|bonjour|salut|hello|coucou|salu)/)) {
-            addAssistantMessage('Bonjour ! Je suis RealiaDev. Ta demande est traitée. Que puis-je faire ?');
-          } else {
-            addFallbackMessage();
-          }
-        }
-      })
-      .catch(function(err) {
-        if (err.name !== 'AbortError') {
-          console.debug('[PollingUX] Erreur polling (silencieuse):', err.message);
-        }
-      });
-  }
-
-  // Nettoyer aussi les messages JSON affichés par sendMessage()
-  function cleanJsonMessages() {
-    var container = document.getElementById('chatMessages');
-    if (!container) return;
-    var msgs = container.querySelectorAll('.msg.agent');
-    msgs.forEach(function(msg) {
-      var html = msg.innerHTML;
-      // Si le message commence par { ou contient "step_results" c'est du JSON brut
-      if (html.indexOf('"step_results"') !== -1 || html.indexOf('"success"') !== -1 || html.indexOf('"task_id"') !== -1) {
-        msg.remove();
-      }
-    });
-  }
-
-  setInterval(pollQueue, POLL_INTERVAL);
-  setTimeout(pollQueue, 500);
-  setInterval(cleanJsonMessages, 2000);
-})();
-</script>
-<!-- 🔄 POLLING ROUTE FIX v1.0 --><!-- 🔄 POLLING ROUTE FIX v1.0 --><!-- 🔄 POLLING ROUTE FIX v1.0 -->
-<script>
-(function() {
-  'use strict';
-  var ORIGIN = window.location.origin;
-  var TARGET_PORT = 8095;
-  var TARGET_HOST = window.location.hostname || 'localhost';
-
-  // Attendre que REALIA_CONFIG soit charge
-  function waitForConfig() {
-    if (window.REALIA_CONFIG && window.REALIA_CONFIG.ports && window.REALIA_CONFIG.ports.ORCHESTRATOR_API) {
-      TARGET_PORT = window.REALIA_CONFIG.ports.ORCHESTRATOR_API;
-      TARGET_HOST = (window.REALIA_CONFIG.hosts && window.REALIA_CONFIG.hosts.local) || window.location.hostname || 'localhost';
-      return true;
-    }
-    if (window.API_BASE) {
-      var match = window.API_BASE.match(/:([0-9]+)$/);
-      if (match) TARGET_PORT = parseInt(match[1], 10);
-      return true;
-    }
-    return false;
-  }
-
-  if (!waitForConfig()) {
-    var checkInterval = setInterval(function() {
-      if (waitForConfig()) clearInterval(checkInterval);
-    }, 200);
-    setTimeout(function() { clearInterval(checkInterval); }, 10000);
-  }
-
-  // Intercepter les fetch vers /agent/swarm/queue sur le mauvais port
-  var origFetch = window.fetch;
-  window.fetch = function(input, init) {
-    var url = (typeof input === 'string') ? input : (input ? input.url : '');
-    if (!url) return origFetch(input, init);
-    try {
-      var parsed = new URL(url, window.location.origin);
-      // Si la requete va vers /agent/swarm/queue sur le port GUI (:8092), rediriger vers :8095
-      if (parsed.pathname === '/agent/swarm/queue' || parsed.pathname.startsWith('/api/task/')) {
-        if (parsed.port && parseInt(parsed.port, 10) === 8092) {
-          parsed.port = TARGET_PORT;
-          parsed.hostname = TARGET_HOST;
-          var newUrl = parsed.toString();
-          console.log('[PollingRouteFix] Redirection vers:', newUrl);
-          if (typeof input === 'string') {
-            return origFetch(newUrl, init);
-          } else {
-            var newReq = new Request(newUrl, input);
-            return origFetch(newReq, init);
-          }
-        }
-      }
-    } catch(e) {}
-    return origFetch(input, init);
-  };
-
-  console.log('[PollingRouteFix] v1.0 actif - cible: ' + TARGET_HOST + ':' + TARGET_PORT);
-})();
-</script>
-<!-- FIN POLLING ROUTE FIX -->
-
-<!-- Swarm Visualizer -->
-<!-- Data Contract — Validation des réponses backend (TOUJOURS EN PREMIER) -->
-<script src="js/data-contract.js?v=20260613_v1"></script>
-<script src="js/swarm-visualizer.js?v=20260613_contract_v1"></script>
-
-<!-- UI Console Script Bus — Gemma4 injecte du JS ici -->
-<script>
-(function() {
-  'use strict';
-  if (window._uiConsolePollingStarted) return;
-  window._uiConsolePollingStarted = true;
-  window._lastUiConsoleResult = null;
-
-  var POLL_INTERVAL = 2000;
-  var currentScriptId = null;
-
-  function pollNextScript() {
-    var apiBase = window.API_BASE || 'http://localhost:8095';
-    fetch(apiBase + '/api/ui-console/next', { signal: AbortSignal.timeout(10000) })
-      .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
-      .then(function(data) {
-        if (!data || !data.script) {
-          currentScriptId = null;
-          return;
-        }
-        currentScriptId = data.id;
-        var scriptStr = data.script;
-        console.log('[UI Console] Exécution script ' + data.id + ' (' + scriptStr.length + ' chars)');
-        try {
-          var fn = new Function(scriptStr);
-          var result = fn();
-          if (result === undefined) result = '(exécuté sans retour)';
-          window._lastUiConsoleResult = result;
-          console.log('[UI Console] Résultat:', result);
-          // Envoyer le résultat au backend
-          fetch(apiBase + '/api/ui-console/result', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ id: currentScriptId, result: String(result).substring(0, 10000) })
-          }).catch(function(e) { console.warn('[UI Console] Échec envoi résultat:', e.message); });
-        } catch(e) {
-          window._lastUiConsoleResult = '❌ ' + e.message;
-          console.error('[UI Console] Erreur:', e.message);
-          fetch(apiBase + '/api/ui-console/result', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ id: currentScriptId, error: String(e.message).substring(0, 5000) })
-          }).catch(function(ee) { console.warn('[UI Console] Échec envoi erreur:', ee.message); });
-        }
-      })
-      .catch(function(err) {
-        if (err.name !== 'AbortError') {
-          console.debug('[UI Console] Polling err (silencieux):', err.message);
-        }
-      });
-  }
-
-  setInterval(pollNextScript, POLL_INTERVAL);
-  setTimeout(pollNextScript, 1000);
-  console.log('[UI Console] Polling démarré (toutes les ' + POLL_INTERVAL + 'ms)');
-})();
-</script>
-</body>
-</html>
+      S
