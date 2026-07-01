@@ -17,6 +17,8 @@ from typing import Optional, Dict, Any, List
 from pathlib import Path
 
 from plan_executor_exceptions import PlanExecutorError, PlanExecutionInProgress, CircularDependencyError, AgentCreationError, InvalidStepError, ModelSwapError, LLMTimeoutError, DuplicateStepError, EmptyPlanError
+from realia_devkit.ws_broadcaster import broadcaster
+from realia_devkit.feature_flags import flags
 
 from planner_template import get_planner_prompt
 from validator_template import get_validator_prompt
@@ -472,7 +474,7 @@ class PlanExecutor:
         finally:
             self._execution_lock.release()
 
-    async def _execute_plan_impl(self, task: str, context: dict = None) -> Dict[str, Any]:
+    async def _execute_plan_impl(self, task: str, context: dict = None, task_id: str = None) -> Dict[str, Any]:
         """Boucle complète PLAN → EXECUTE → VALIDATE → LOOP/TERMINATE.
         
         Args:
@@ -538,7 +540,9 @@ class PlanExecutor:
                 while not step_passed and attempt <= self.max_loops:
                     if attempt > 0:
                         logger.info(f"SWARM_LOOP | step={step_num} | attempt={attempt}/{self.max_loops}")
-                        self.loop_count += 1  # compter cette iteration comme une retry
+                        self.loop_count += 1
+                        if flags.USE_WEBSOCKET and task_id:
+                            await broadcaster.emit_task_progress(task_id, step_num, len(self.plan) or 1, instruction[:50])  # compter cette iteration comme une retry
                         # Ajouter le feedback de validation comme contexte de correction
                         fix_instruction = instruction
                         if validation.get("suggested_fix"):

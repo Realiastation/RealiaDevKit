@@ -69,6 +69,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+# ── WebSocket API Contract v1.0.0 ────────────────────────────────────
+from realia_devkit.ws_server import router as ws_router
+from realia_devkit.feature_flags import get_feature_flags, flags
+from realia_devkit.ws_broadcaster import broadcaster
+
 # ── Logging ──────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -353,21 +358,30 @@ async def swarm_worker():
         task_id, payload = await SWARM_QUEUE.get()
         try:
             SWARM_TASKS[task_id]["status"] = "running"
+            if flags.USE_WEBSOCKET:
+                await broadcaster.emit_task_started(task_id)
             async with SWARM_LOCK:
                 logger.info(f"SWARM_LOCK_ACQUIRED | task={task_id}")
                 router = SwarmRouter(max_steps=5)
                 result = await router.execute(payload.get("task", ""), context=payload.get("context", {}), model_preference=payload.get("mode"))
                 SWARM_TASKS[task_id].update({"status": "completed", "result": result})
                 logger.info(f"SWARM_LOCK_RELEASED | task={task_id} | status=completed")
+                if flags.USE_WEBSOCKET:
+                    await broadcaster.emit_task_completed(task_id, result or {}, 0.0)
         except Exception as e:
             SWARM_TASKS[task_id].update({"status": "failed", "error": str(e)})
             logger.error(f"SWARM_TASK_FAILED | task={task_id} | error={e}")
+            if flags.USE_WEBSOCKET:
+                await broadcaster.emit_task_failed(task_id, str(e), type(e).__name__, 0)
         finally:
             SWARM_QUEUE.task_done()
 # ========================================
 
 # ── App FastAPI ──────────────────────────────────────────────────────────
 app = FastAPI(title="DevKit Orchestrator (UTU Core)", version="2.0.0")
+
+# WebSocket API Contract v1.0.0 — endpoint /ws/task/{task_id}
+app.include_router(ws_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -400,7 +414,7 @@ def _format_tool_schemas() -> str:
 # ========================================================================
 
 # === Dreaming V3 — Journalier (log d'interactions brutes) ===
-LOGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+LOGS_DIR = os.environ.get("REALIA_LOG_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"))
 
 def log_interaction(agent_name: str, role: str, content: str) -> None:
     """Journalier : écrit une interaction dans logs/YYYY-MM-DD.jsonl.
@@ -427,7 +441,7 @@ def log_interaction(agent_name: str, role: str, content: str) -> None:
 
 
 # === Dreaming V3 — Injecteur de mémoire à long terme ===
-MEMORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state_memoire.json")
+MEMORY_FILE = os.environ.get("REALIA_MEMORY_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "state_memoire.json"))
 
 # === Dreaming V3 — Sliding Window (mémoire de travail court terme) ===
 SLIDING_WINDOW_MAX = 10
@@ -535,6 +549,38 @@ def flush_sliding_window_to_logs(projet_id: str = "live") -> None:
     except Exception as e:
         logger.warning(f"FLUSH_SLIDING_ERROR | {e}")
         # Ne jamais bloquer le flux principal pour un problème de logs
+
+
+# === Dreaming V3 — Intervalle de flush périodique ===
+FLUSH_INTERVAL_S = int(os.environ.get("REALIA_FLUSH_INTERVAL_S", "300"))  # KV-cache (Layer 1) = état binaire d'attention (opaque, rapide, fragile)
+# Sliding Window (Layer 2) = messages textuels de la conversation (lisible, portable)
+# Les deux sont COMPLÉMENTAIRES, pas redondants.
+"""Intervalle en secondes entre deux flush périodiques du sliding window.
+Défaut: 300s (5 min). Variable d'env: REALIA_FLUSH_INTERVAL_S.
+"""
+
+
+async def periodic_flush_task() -> None:
+    """Tâche asynchrone de flush périodique du sliding window.
+
+    Évite la perte de données conversationnelles en cas de crash entre deux
+    tâches. Flushe le sliding window dans les logs JSONL du jour à intervalle
+    régulier (FLUSH_INTERVAL_S secondes).
+
+    Logs structurés au format PERIODIC_FLUSH pour traçabilité.
+    """
+    while True:
+        await asyncio.sleep(FLUSH_INTERVAL_S)
+        agent_count = len(conversation_history)
+        if agent_count > 0:
+            msg_count = sum(len(msgs) for msgs in conversation_history.values())
+            logger.info(
+                f"PERIODIC_FLUSH | agents={agent_count} | messages={msg_count} | "
+                f"interval={FLUSH_INTERVAL_S}s"
+            )
+            flush_sliding_window_to_logs(projet_id="periodic")
+        else:
+            logger.debug(f"PERIODIC_FLUSH | buffer vide | interval={FLUSH_INTERVAL_S}s")
 
 
 # === Dreaming V3 — Boucle d'apprentissage active (Self-Correction) ===
@@ -747,7 +793,9 @@ async def startup_swarm_worker():
     await _ensure_llama_server_running()
     # 2. Lancer le worker de la file d'attente
     asyncio.create_task(swarm_worker())
-    logger.info("🔄 Swarm Queue Worker started")
+    # 3. Lancer le flush périodique du sliding window (Dreaming V3)
+    asyncio.create_task(periodic_flush_task())
+    logger.info(f"🔄 Swarm Queue Worker started (flush interval={FLUSH_INTERVAL_S}s)")
 
 # ── Schémas ──────────────────────────────────────────────────────────────
 class QueryRequest(BaseModel):
@@ -1191,7 +1239,12 @@ class SwarmRouter:
         gguf_model = cache_manager.api._resolve_model(model)
         _t_resolve = time.time()
         
-        # ── Swap séquentiel : sauvegarde + kill/restart + restauration ──
+        # ── Swap séquentiel (Layer 1 → Layer 2 complémentarité) ─────────
+        # KV-cache (Layer 1) = état binaire d'attention (opaque, rapide, fragile)
+        # Sliding Window (Layer 2) = messages textuels (lisible, portable, réinjecté)
+        # Les deux sont COMPLÉMENTAIRES : le KV-cache sauvegarde les patterns
+        # d'attention, le Sliding Window (réinjecté via _format_sliding_window)
+        # préserve les messages bruts pour le prochain prompt.
         if swapper.current_model != model:
             logger.info(f"[PERF] SWAP_NEEDED | from={swapper.current_model} to={model} | dt={time.time()-_t0:.2f}s")
             if swapper.current_model is not None:
@@ -1434,7 +1487,11 @@ class SwarmRouter:
         _update_sliding_window(config_name, prompt[:2000], final[:2000])
         log_interaction(config_name, "assistant", final[:2000])
         
-        # ── Cache Roaming : sauvegarde du slot APRÈS inférence ──────────
+        # ── Cache Roaming (Layer 1) : sauvegarde du slot APRÈS inférence ─────
+        # KV-cache = état binaire d'attention du modèle (opaque, rapide, fragile)
+        # Sliding Window (Layer 2) = messages textuels de la conversation (lisible, portable)
+        # Les deux sont COMPLÉMENTAIRES, pas redondants.
+        # Le KV-cache préserve l'attention pattern ; le sliding window préserve le texte brut.
         try:
             await cache_manager.save_slot(slot_id=0, context_name=f"call_utu_{model}", model=gguf_model)
         except Exception:
@@ -1737,6 +1794,12 @@ async def ui_console_result(req: dict):
         UI_CONSOLE_RESULTS[script_id] = result or error or "(exécuté)"
         logger.info(f"UI_CONSOLE_RESULT | id={script_id} | len={len(result or error)}")
     return {"success": True}
+
+
+@app.get("/config/feature-flags")
+async def get_feature_flags_endpoint():
+    """Retourne feature flags pour frontend (API Contract v1.0.0)."""
+    return get_feature_flags()
 
 
 @app.get("/api/ui-console/result/{script_id}")
